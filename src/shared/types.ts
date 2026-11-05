@@ -107,4 +107,5 @@ export interface RegenRecordWire {
   token: string;
   /** Every chunk of the answer, in the order it was posted. */
   chunkIds: string[];
+  answerText: string;
 }

@@ -286,6 +286,13 @@ describe("Discord delivery and regeneration", () => {
     const handle = (url: string, options?: RequestInit) => {
       const method = options?.method ?? "GET";
       const body = options?.body ? JSON.parse(String(options.body)) : null;
+      const channelMatch = url.match(/channels\/([^/?]+)\/messages\/([^?]+)/);
+      if (channelMatch) {
+        const [, , msgId] = channelMatch;
+        const msg = messages.get(msgId);
+        if (msg) return json(msg);
+        return json({ message: "Unknown Message" }, 404);
+      }
       const [, token, target] = url.match(/webhooks\/app\/([^/?]+)(?:\/messages\/([^?]+))?/) ?? [];
       let id: string;
       if (method === "POST") id = String(++next);
@@ -455,5 +462,353 @@ describe("Discord delivery and regeneration", () => {
       ((await (await handleInteraction(interaction, env)).json()) as any).data.content,
     ).toContain("あなたの設定画面ではありません");
     expect(state.getPrefs("123").model).toBe("auto");
+  });
+
+  test("continue job carries over history from RegenRecord including multi-chunk answer", async () => {
+    const { state, env, kv, ready } = setup();
+    await ready();
+    kv.set("ai_registry", registry());
+    state.setPref("123", "model", model().id);
+    const discord = fakeDiscord();
+    const chatRequests: any[] = [];
+    spyOn(globalThis, "fetch").mockImplementation((async (url: string, options?: RequestInit) => {
+      if (url.includes("/generation")) return json({ data: { total_cost: 0.001 } });
+      if (url.includes("/chat/completions")) {
+        const body = options?.body ? JSON.parse(String(options.body)) : null;
+        chatRequests.push(body);
+        return json({
+          id: `g${chatRequests.length}`,
+          model: model().id,
+          choices: [
+            {
+              message: {
+                content:
+                  chatRequests.length === 1
+                    ? "あ".repeat(3000)
+                    : "日本の首都は東京で、人口は約1400万人です。",
+              },
+              finish_reason: "stop",
+            },
+          ],
+        });
+      }
+      if (url.startsWith("https://discord.mock/")) return discord.handle(url, options);
+      throw new Error(`unexpected request: ${url}`);
+    }) as any);
+
+    const slashStorage = context();
+    const slashJob = new JobDO(slashStorage.ctx as any, env);
+    await slashJob.start({
+      kind: "slash",
+      token: "tok1",
+      userId: "123",
+      ephemeral: true,
+      prompt: "日本の首都は？",
+      attachment: null,
+    });
+    await slashJob.alarm();
+
+    expect(discord.messages.has("1")).toBe(true);
+    expect(discord.messages.has("2")).toBe(true);
+    const rec1 = state.getRegenRecord("2");
+    expect(rec1?.answerText).toBe("あ".repeat(3000));
+
+    const contStorage = context();
+    const contJob = new JobDO(contStorage.ctx as any, env);
+    await contJob.start({
+      kind: "continue",
+      token: "tok2",
+      userId: "123",
+      ephemeral: true,
+      prompt: "人口は？",
+      channelId: "channel",
+      messageId: "2",
+    });
+    await contJob.alarm();
+
+    expect(chatRequests).toHaveLength(2);
+    const contMessages = chatRequests[1].messages.slice(1);
+    expect(contMessages).toHaveLength(3);
+    expect(contMessages[0]).toEqual({
+      role: "user",
+      content: [{ type: "text", text: "日本の首都は？" }],
+    });
+    expect(contMessages[1]).toEqual({
+      role: "assistant",
+      content: [{ type: "text", text: "あ".repeat(3000) }],
+    });
+    expect(contMessages[2]).toEqual({
+      role: "user",
+      content: [{ type: "text", text: "人口は？" }],
+    });
+
+    const rec2 = state.getRegenRecord("3");
+    expect(rec2?.answerText).toBe("日本の首都は東京で、人口は約1400万人です。");
+  });
+
+  test("continue job trims history to HISTORY_DEPTH across multiple turns", async () => {
+    const { state, env, kv, ready } = setup();
+    await ready();
+    kv.set("ai_registry", registry());
+    state.setPref("123", "model", model().id);
+    const discord = fakeDiscord();
+    const chatRequests: any[] = [];
+    spyOn(globalThis, "fetch").mockImplementation((async (url: string, options?: RequestInit) => {
+      if (url.includes("/generation")) return json({ data: { total_cost: 0.001 } });
+      if (url.includes("/chat/completions")) {
+        const body = options?.body ? JSON.parse(String(options.body)) : null;
+        chatRequests.push(body);
+        return json({
+          id: `g${chatRequests.length}`,
+          model: model().id,
+          choices: [{ message: { content: `回答 ${chatRequests.length}` }, finish_reason: "stop" }],
+        });
+      }
+      if (url.startsWith("https://discord.mock/")) return discord.handle(url, options);
+      throw new Error(`unexpected request: ${url}`);
+    }) as any);
+
+    const j1 = new JobDO(context().ctx as any, env);
+    await j1.start({
+      kind: "slash",
+      token: "t1",
+      userId: "123",
+      ephemeral: false,
+      prompt: "Q1",
+      attachment: null,
+    });
+    await j1.alarm();
+
+    const j2 = new JobDO(context().ctx as any, env);
+    await j2.start({
+      kind: "continue",
+      token: "t2",
+      userId: "123",
+      ephemeral: false,
+      prompt: "Q2",
+      channelId: "channel",
+      messageId: "1",
+    });
+    await j2.alarm();
+
+    const j3 = new JobDO(context().ctx as any, env);
+    await j3.start({
+      kind: "continue",
+      token: "t3",
+      userId: "123",
+      ephemeral: false,
+      prompt: "Q3",
+      channelId: "channel",
+      messageId: "2",
+    });
+    await j3.alarm();
+
+    const j4 = new JobDO(context().ctx as any, env);
+    await j4.start({
+      kind: "continue",
+      token: "t4",
+      userId: "123",
+      ephemeral: false,
+      prompt: "Q4",
+      channelId: "channel",
+      messageId: "3",
+    });
+    await j4.alarm();
+
+    expect(chatRequests).toHaveLength(4);
+    const turn4Messages = chatRequests[3].messages.slice(1);
+    expect(turn4Messages).toHaveLength(5);
+    expect(turn4Messages[0]).toEqual({ role: "user", content: [{ type: "text", text: "Q2" }] });
+    expect(turn4Messages[1]).toEqual({
+      role: "assistant",
+      content: [{ type: "text", text: "回答 2" }],
+    });
+    expect(turn4Messages[2]).toEqual({ role: "user", content: [{ type: "text", text: "Q3" }] });
+    expect(turn4Messages[3]).toEqual({
+      role: "assistant",
+      content: [{ type: "text", text: "回答 3" }],
+    });
+    expect(turn4Messages[4]).toEqual({ role: "user", content: [{ type: "text", text: "Q4" }] });
+  });
+
+  test("continue job degenerates attachments older than the last 2 user turns", async () => {
+    const { state, env, kv, ready } = setup();
+    await ready();
+    const m = model();
+    m.tags = ["vision"];
+    kv.set("ai_registry", { ...registry(), models: [m] });
+    state.setPref("123", "model", m.id);
+    const discord = fakeDiscord();
+    const chatRequests: any[] = [];
+    spyOn(globalThis, "fetch").mockImplementation((async (url: string, options?: RequestInit) => {
+      if (url.includes("/generation")) return json({ data: { total_cost: 0.001 } });
+      if (url.includes("/chat/completions")) {
+        const body = options?.body ? JSON.parse(String(options.body)) : null;
+        chatRequests.push(body);
+        return json({
+          id: `g${chatRequests.length}`,
+          model: m.id,
+          choices: [{ message: { content: `回答 ${chatRequests.length}` }, finish_reason: "stop" }],
+        });
+      }
+      if (url.startsWith("https://discord.mock/")) return discord.handle(url, options);
+      throw new Error(`unexpected request: ${url}`);
+    }) as any);
+
+    const j1 = new JobDO(context().ctx as any, env);
+    await j1.start({
+      kind: "slash",
+      token: "t1",
+      userId: "123",
+      ephemeral: false,
+      prompt: "この画像は何？",
+      attachment: {
+        id: "att1",
+        filename: "cat.png",
+        size: 1024,
+        url: "https://discord.mock/cat.png",
+        content_type: "image/png",
+      },
+    });
+    await j1.alarm();
+
+    const j2 = new JobDO(context().ctx as any, env);
+    await j2.start({
+      kind: "continue",
+      token: "t2",
+      userId: "123",
+      ephemeral: false,
+      prompt: "Q2",
+      channelId: "channel",
+      messageId: "1",
+    });
+    await j2.alarm();
+
+    expect(
+      chatRequests[1].messages.slice(1)[0].content.some((b: any) => b.type === "image_url"),
+    ).toBe(true);
+
+    const j3 = new JobDO(context().ctx as any, env);
+    await j3.start({
+      kind: "continue",
+      token: "t3",
+      userId: "123",
+      ephemeral: false,
+      prompt: "Q3",
+      channelId: "channel",
+      messageId: "2",
+    });
+    await j3.alarm();
+
+    const turn3Messages = chatRequests[2].messages.slice(1);
+    expect(turn3Messages[0].content.some((b: any) => b.type === "image_url")).toBe(false);
+    expect(turn3Messages[0].content[0].text).toContain("（以前のメッセージのため省略）");
+  });
+
+  test("continue job falls back to parsing message content when RegenRecord is missing", async () => {
+    const { state, env, kv, ready } = setup();
+    await ready();
+    kv.set("ai_registry", registry());
+    state.setPref("123", "model", model().id);
+    const discord = fakeDiscord();
+    discord.messages.set("99", {
+      id: "99",
+      channel_id: "channel",
+      author: { id: "app" },
+      content: "**Q:** キャッシュ外の質問\n\n**A:**\nキャッシュ外の回答\n\n-# モデル: auto",
+      attachments: [],
+    });
+    const chatRequests: any[] = [];
+    spyOn(globalThis, "fetch").mockImplementation((async (url: string, options?: RequestInit) => {
+      if (url.includes("/generation")) return json({ data: { total_cost: 0.001 } });
+      if (url.includes("/chat/completions")) {
+        const body = options?.body ? JSON.parse(String(options.body)) : null;
+        chatRequests.push(body);
+        return json({
+          id: "g",
+          model: model().id,
+          choices: [{ message: { content: "フォールバック回答" }, finish_reason: "stop" }],
+        });
+      }
+      if (url.startsWith("https://discord.mock/")) return discord.handle(url, options);
+      throw new Error(`unexpected request: ${url}`);
+    }) as any);
+
+    const job = new JobDO(context().ctx as any, env);
+    await job.start({
+      kind: "continue",
+      token: "tok-fallback",
+      userId: "123",
+      ephemeral: true,
+      prompt: "フォールバックの継続質問",
+      channelId: "channel",
+      messageId: "99",
+    });
+    await job.alarm();
+
+    expect(chatRequests).toHaveLength(1);
+    const msgs = chatRequests[0].messages.slice(1);
+    expect(msgs).toHaveLength(3);
+    expect(msgs[0]).toEqual({
+      role: "user",
+      content: [{ type: "text", text: "キャッシュ外の質問" }],
+    });
+    expect(msgs[1]).toEqual({
+      role: "assistant",
+      content: [{ type: "text", text: "キャッシュ外の回答" }],
+    });
+    expect(msgs[2]).toEqual({
+      role: "user",
+      content: [{ type: "text", text: "フォールバックの継続質問" }],
+    });
+  });
+
+  test("continue job falls back to synthetic anchor when bot message is unparseable", async () => {
+    const { state, env, kv, ready } = setup();
+    await ready();
+    kv.set("ai_registry", registry());
+    state.setPref("123", "model", model().id);
+    const discord = fakeDiscord();
+    discord.messages.set("98", {
+      id: "98",
+      channel_id: "channel",
+      author: { id: "app" },
+      content: "旧形式のパース不能なメッセージ",
+      attachments: [],
+    });
+    const chatRequests: any[] = [];
+    spyOn(globalThis, "fetch").mockImplementation((async (url: string, options?: RequestInit) => {
+      if (url.includes("/generation")) return json({ data: { total_cost: 0.001 } });
+      if (url.includes("/chat/completions")) {
+        const body = options?.body ? JSON.parse(String(options.body)) : null;
+        chatRequests.push(body);
+        return json({
+          id: "g",
+          model: model().id,
+          choices: [{ message: { content: "アンカー回答" }, finish_reason: "stop" }],
+        });
+      }
+      if (url.startsWith("https://discord.mock/")) return discord.handle(url, options);
+      throw new Error(`unexpected request: ${url}`);
+    }) as any);
+
+    const job = new JobDO(context().ctx as any, env);
+    await job.start({
+      kind: "continue",
+      token: "tok-anchor",
+      userId: "123",
+      ephemeral: true,
+      prompt: "次の質問",
+      channelId: "channel",
+      messageId: "98",
+    });
+    await job.alarm();
+
+    expect(chatRequests).toHaveLength(1);
+    const msgs = chatRequests[0].messages.slice(1);
+    expect(msgs).toHaveLength(3);
+    expect(msgs[0].content[0].text).toBe("(以下は以前のやり取りの続きです)");
+    expect(msgs[1].content[0].text).toBe("旧形式のパース不能なメッセージ");
+    expect(msgs[2].content[0].text).toBe("次の質問");
   });
 });

@@ -56,6 +56,7 @@ interface RecordRow extends Record<string, SqlStorageValue> {
   header: string;
   ephemeral: number;
   token: string;
+  answer_text: string;
 }
 
 interface IndexRow extends Record<string, SqlStorageValue> {
@@ -566,9 +567,13 @@ export class StateDO extends DurableObject<Env> {
           header      TEXT NOT NULL,
           ephemeral   INTEGER NOT NULL,
           token       TEXT NOT NULL,
-          created_at  INTEGER NOT NULL
+          created_at  INTEGER NOT NULL,
+          answer_text TEXT NOT NULL DEFAULT ''
         );
       `);
+      const regenColumns = sql.exec("PRAGMA table_info(regen_records)").toArray();
+      if (!regenColumns.some((column) => column.name === "answer_text"))
+        sql.exec("ALTER TABLE regen_records ADD COLUMN answer_text TEXT NOT NULL DEFAULT ''");
       sql.exec(`
         CREATE TABLE IF NOT EXISTS regen_index (
           message_id  TEXT PRIMARY KEY,
@@ -679,21 +684,23 @@ export class StateDO extends DurableObject<Env> {
     header: string;
     ephemeral: boolean;
     token: string;
+    answerText?: string;
   }): void {
     if (!record.chunkIds.length) return;
     const sql = this.ctx.storage.sql;
     const recordId = record.chunkIds[0];
 
     sql.exec(
-      `INSERT INTO regen_records (record_id, messages, user_id, header, ephemeral, token, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO regen_records (record_id, messages, user_id, header, ephemeral, token, created_at, answer_text)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(record_id) DO UPDATE SET
          messages = excluded.messages,
          user_id = excluded.user_id,
          header = excluded.header,
          ephemeral = excluded.ephemeral,
          token = excluded.token,
-         created_at = excluded.created_at`,
+         created_at = excluded.created_at,
+         answer_text = excluded.answer_text`,
       recordId,
       record.messagesJson,
       record.userId,
@@ -701,6 +708,7 @@ export class StateDO extends DurableObject<Env> {
       record.ephemeral ? 1 : 0,
       record.token,
       Date.now(),
+      record.answerText ?? "",
     );
     sql.exec("DELETE FROM regen_index WHERE record_id = ?", recordId);
     record.chunkIds.forEach((id, position) => {
@@ -756,6 +764,7 @@ export class StateDO extends DurableObject<Env> {
       ephemeral: !!row.ephemeral,
       token: row.token,
       chunkIds,
+      answerText: row.answer_text as string,
     };
   }
 }

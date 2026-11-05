@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { chunkText } from "../src/discord/chunk";
-import { attachmentBlocks, newBudget, normalizeTurns } from "../src/discord/history";
+import {
+  attachmentBlocks,
+  buildHistoryFromMessage,
+  newBudget,
+  normalizeTurns,
+  parseBotAnswer,
+  pruneConversationHistory,
+  textBlock,
+} from "../src/discord/history";
 import { settingsSummary } from "../src/settings/ui";
 import { DISCORD_CHUNK_LIMIT } from "../src/shared/constants";
 import type { Prefs } from "../src/shared/types";
@@ -148,5 +156,162 @@ describe("attachmentBlocks", () => {
     const many = Array.from({ length: 12 }, () => att());
     expect(attachmentBlocks(many, budget)).toHaveLength(16);
     expect(budget.count).toBe(8);
+  });
+});
+
+describe("parseBotAnswer", () => {
+  test("extracts prompt and answer from a standard bot answer and removes the footer", () => {
+    const content = "**Q:** 日本の首都は？\n\n**A:**\n東京です。\n\n-# モデル: auto｜費用 ¥0.01";
+    expect(parseBotAnswer(content)).toEqual({
+      prompt: "日本の首都は？",
+      answer: "東京です。",
+    });
+  });
+
+  test("extracts multiline prompt and multiline answer", () => {
+    const content = "**Q:** 1行目\n2行目\n\n**A:**\n回答1行目\n回答2行目\n\n-# モデル: claude";
+    expect(parseBotAnswer(content)).toEqual({
+      prompt: "1行目\n2行目",
+      answer: "回答1行目\n回答2行目",
+    });
+  });
+
+  test("handles answer without footer", () => {
+    const content = "**Q:** こんにちは\n\n**A:**\nこんにちは！";
+    expect(parseBotAnswer(content)).toEqual({
+      prompt: "こんにちは",
+      answer: "こんにちは！",
+    });
+  });
+
+  test("handles CRLF line endings and trailing whitespace on A line", () => {
+    const content =
+      "**Q:** 日本の首都は？\r\n\r\n**A:**  \r\n東京です。\r\n\r\n-# モデル: auto｜費用 ¥0.01";
+    expect(parseBotAnswer(content)).toEqual({
+      prompt: "日本の首都は？",
+      answer: "東京です。",
+    });
+  });
+
+  test("returns null for non-bot messages or empty prompt/answer", () => {
+    expect(parseBotAnswer("ただのユーザーメッセージ")).toBeNull();
+    expect(parseBotAnswer("**Q:** \n\n**A:**\n回答")).toBeNull();
+    expect(parseBotAnswer("**Q:** 質問\n\n**A:**\n-# 準備中… 1秒")).toBeNull();
+    expect(parseBotAnswer("")).toBeNull();
+  });
+});
+
+describe("pruneConversationHistory", () => {
+  test("maintains alternating turns and keeps role: user as the first turn", () => {
+    const messages = [
+      { role: "assistant" as const, content: [textBlock("最初の回答")] },
+      { role: "user" as const, content: [textBlock("質問")] },
+    ];
+    const pruned = pruneConversationHistory(messages);
+    expect(pruned[0].role).toBe("user");
+    expect(pruned).toHaveLength(1);
+  });
+
+  test("trims older turns in user-assistant pairs when history exceeds HISTORY_DEPTH", () => {
+    const messages = [
+      { role: "user" as const, content: [textBlock("Q1")] },
+      { role: "assistant" as const, content: [textBlock("A1")] },
+      { role: "user" as const, content: [textBlock("Q2")] },
+      { role: "assistant" as const, content: [textBlock("A2")] },
+      { role: "user" as const, content: [textBlock("Q3")] },
+      { role: "assistant" as const, content: [textBlock("A3")] },
+      { role: "user" as const, content: [textBlock("Q4")] },
+    ];
+    const pruned = pruneConversationHistory(messages);
+    expect(pruned).toHaveLength(5);
+    expect(pruned[0]).toEqual({ role: "user", content: [textBlock("Q2")] });
+    expect(pruned[pruned.length - 1]).toEqual({ role: "user", content: [textBlock("Q4")] });
+  });
+
+  test("preserves attachments in the last 2 user turns and degenerates older ones", () => {
+    const attBlock = (file: string) => [
+      textBlock(`[添付: ${file}]`),
+      { type: "image", source: { type: "url", url: `https://example.com/${file}` } },
+      textBlock(`この${file}は何？`),
+    ];
+    const messages = [
+      { role: "user" as const, content: attBlock("old.png") },
+      { role: "assistant" as const, content: [textBlock("昔の回答")] },
+      { role: "user" as const, content: attBlock("mid.png") },
+      { role: "assistant" as const, content: [textBlock("中間の回答")] },
+      { role: "user" as const, content: attBlock("new.png") },
+    ];
+    const pruned = pruneConversationHistory(messages);
+    expect(pruned).toHaveLength(5);
+    expect(pruned[0].content).toEqual([
+      textBlock("[添付: old.png（以前のメッセージのため省略）]"),
+      textBlock("このold.pngは何？"),
+    ]);
+    expect(pruned[2].content[1].type).toBe("image");
+    expect(pruned[4].content[1].type).toBe("image");
+  });
+
+  test("decodes URL-encoded filenames when degenerating standalone attachments", () => {
+    const messages = [
+      {
+        role: "user" as const,
+        content: [
+          {
+            type: "image" as const,
+            source: { type: "url", url: "https://discord.mock/%E7%8C%AB.png?size=1024" },
+          },
+          textBlock("猫の画像です"),
+        ],
+      },
+      { role: "assistant" as const, content: [textBlock("かわいい猫ですね")] },
+      { role: "user" as const, content: [textBlock("次")] },
+      { role: "assistant" as const, content: [textBlock("回答")] },
+      { role: "user" as const, content: [textBlock("最新")] },
+    ];
+    const pruned = pruneConversationHistory(messages);
+    expect(pruned[0].content[0]).toEqual(textBlock("[添付: 猫.png（以前のメッセージのため省略）]"));
+  });
+});
+
+describe("buildHistoryFromMessage", () => {
+  test("does not duplicate prompt when bot message references the original user message, and attaches files", async () => {
+    const messages: Record<string, any> = {
+      m1: {
+        id: "m1",
+        channel_id: "c",
+        author: { id: "user1" },
+        content: "日本の首都は？",
+        attachments: [
+          {
+            id: "att1",
+            filename: "tokyo.png",
+            size: 1024,
+            url: "https://example.com/tokyo.png",
+            content_type: "image/png",
+          },
+        ],
+      },
+      m2: {
+        id: "m2",
+        channel_id: "c",
+        author: { id: "app" },
+        content: "**Q:** 日本の首都は？\n\n**A:**\n東京です。\n\n-# モデル: auto",
+        attachments: [],
+        message_reference: { message_id: "m1" },
+      },
+    };
+    const discord = {
+      appId: "app",
+      fetchMessage: async (_channel: string, id: string) => messages[id],
+    };
+    const turns = await buildHistoryFromMessage(messages.m2, discord as any);
+    expect(turns).toHaveLength(2);
+    expect(turns[0].role).toBe("user");
+    expect(turns[1].role).toBe("assistant");
+    expect(turns[1].content).toEqual([textBlock("東京です。")]);
+    expect(turns[0].content).toHaveLength(3);
+    expect(turns[0].content[0]).toEqual(textBlock("[添付: tokyo.png]"));
+    expect(turns[0].content[1].type).toBe("image");
+    expect(turns[0].content[2]).toEqual(textBlock("日本の首都は？"));
   });
 });

@@ -88,6 +88,96 @@ export function normalizeTurns(turns: AnthropicMessage[]): AnthropicMessage[] {
   return merged;
 }
 
+export function parseBotAnswer(content: string): { prompt: string; answer: string } | null {
+  const normalized = content.replace(/\r\n/g, "\n");
+  const trimmed = normalized.trim();
+  const match = trimmed.match(/^\*\*Q:\*\*\s*([\s\S]*?)\n\n\*\*A:\*\*[ \t]*\n([\s\S]*)$/);
+  if (!match) return null;
+  const prompt = match[1].trim();
+  const rawAnswer = match[2];
+  const answer = rawAnswer
+    .trimEnd()
+    .replace(/(?:(?:\n\n?|^)-#[^\n]*)+$/, "")
+    .trim();
+  if (!prompt || !answer) return null;
+  return { prompt, answer };
+}
+
+function decodeFilename(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch (err) {
+    if (!(err instanceof URIError)) throw err;
+    // A literal "%" in a filename is not valid percent-encoding; show the name as-is.
+    return raw;
+  }
+}
+
+function degenerateAttachments(content: ContentBlock[]): ContentBlock[] {
+  const result: ContentBlock[] = [];
+  for (let i = 0; i < content.length; i++) {
+    const block = content[i];
+    if (block.type === "text" && typeof block.text === "string") {
+      const match = block.text.match(/^\[添付: (.+)\]$/);
+      if (match && !block.text.includes("（以前のメッセージのため省略）")) {
+        const next = content[i + 1];
+        if (next && (next.type === "image" || next.type === "document")) {
+          result.push(textBlock(`[添付: ${match[1]}（以前のメッセージのため省略）]`));
+          i++;
+          continue;
+        }
+      }
+    }
+    if (block.type === "image" || block.type === "document") {
+      const url = block.source?.url;
+      // The URL was written by attachmentBlocks from a Discord attachment, so it is always absolute.
+      const filename =
+        typeof url === "string"
+          ? decodeFilename(new URL(url).pathname.split("/").pop() || "ファイル")
+          : "ファイル";
+      result.push(textBlock(`[添付: ${filename}（以前のメッセージのため省略）]`));
+      continue;
+    }
+    result.push(block);
+  }
+  return result;
+}
+
+export function pruneConversationHistory(messages: AnthropicMessage[]): AnthropicMessage[] {
+  let pruned = normalizeTurns(messages);
+  while (pruned.length > 0 && pruned[0].role !== "user") {
+    pruned = pruned.slice(1);
+  }
+  while (pruned.length > HISTORY_DEPTH) {
+    if (pruned[0]?.role === "user" && pruned[1]?.role === "assistant") {
+      pruned = pruned.slice(2);
+    } else {
+      pruned = pruned.slice(1);
+    }
+    while (pruned.length > 0 && pruned[0].role !== "user") {
+      pruned = pruned.slice(1);
+    }
+  }
+
+  const userIndices: number[] = [];
+  for (let i = 0; i < pruned.length; i++) {
+    if (pruned[i].role === "user") {
+      userIndices.push(i);
+    }
+  }
+  const keepIndices = new Set(userIndices.slice(-ATTACHMENT_TURNS));
+
+  return pruned.map((turn, idx) => {
+    if (turn.role !== "user" || keepIndices.has(idx)) {
+      return turn;
+    }
+    return {
+      role: turn.role,
+      content: degenerateAttachments(turn.content),
+    };
+  });
+}
+
 export async function buildHistoryFromMessage(
   startMessage: DiscordMessage,
   discord: DiscordClient,
@@ -98,28 +188,48 @@ export async function buildHistoryFromMessage(
   const budget = newBudget();
   let curr: DiscordMessage | null = startMessage;
   let userTurns = 0;
+  let pendingBotUserTurn: AnthropicMessage | null = null;
 
   for (let i = 0; i < limit; i++) {
     if (curr === null) break;
     // A bot's user id and its application id are the same value.
     const isBot = curr.author?.id === appId;
-    const role: "user" | "assistant" = isBot ? "assistant" : "user";
     const text = (curr.content ?? "").split(`<@${appId}>`).join("").trim();
 
-    // Only user turns carry attachments — the assistant role rejects image blocks. Files are
-    // re-billed on every follow-up, so older turns keep just their names.
-    let content: ContentBlock[] = [];
-    if (!isBot) {
+    if (isBot) {
+      pendingBotUserTurn = null;
+      const parsed = parseBotAnswer(text);
+      if (parsed) {
+        const userTurn: AnthropicMessage = {
+          role: "user",
+          content: [textBlock(parsed.prompt)],
+        };
+        turns.unshift({ role: "assistant", content: [textBlock(parsed.answer)] });
+        turns.unshift(userTurn);
+        pendingBotUserTurn = userTurn;
+      } else if (text) {
+        turns.unshift({ role: "assistant", content: [textBlock(text)] });
+      }
+    } else {
       userTurns += 1;
-      content =
+      const atts =
         userTurns <= ATTACHMENT_TURNS
           ? attachmentBlocks(curr.attachments ?? [], budget)
           : (curr.attachments ?? [])
               .filter(isSupportedAttachment)
               .map((att) => textBlock(`[添付: ${att.filename}（以前のメッセージのため省略）]`));
+
+      if (pendingBotUserTurn) {
+        if (atts.length) {
+          pendingBotUserTurn.content = [...atts, ...pendingBotUserTurn.content];
+        }
+        pendingBotUserTurn = null;
+      } else {
+        const content = [...atts];
+        if (text) content.push(textBlock(text));
+        if (content.length) turns.unshift({ role: "user", content });
+      }
     }
-    if (text) content.push(textBlock(text));
-    if (content.length) turns.unshift({ role, content });
 
     const refId = curr.message_reference?.message_id;
     const refChannel = curr.message_reference?.channel_id ?? curr.channel_id;

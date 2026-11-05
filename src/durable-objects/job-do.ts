@@ -15,7 +15,7 @@ import {
   attachmentBlocks,
   buildHistoryFromMessage,
   newBudget,
-  normalizeTurns,
+  pruneConversationHistory,
   textBlock,
 } from "../discord/history";
 import { handleInteraction } from "../discord/interactions";
@@ -282,8 +282,21 @@ export class JobDO extends DurableObject<Env> {
       messages = [{ role: "user", content }];
     } else {
       const target = await this.resolveTarget(job, discord);
-      const history = await buildHistoryFromMessage(target, discord);
-      messages = normalizeTurns([...history, { role: "user", content: [textBlock(job.prompt)] }]);
+      const record = await this.state().getRegenRecord(target.id);
+      if (record?.answerText) {
+        const prior = JSON.parse(record.messagesJson) as AnthropicMessage[];
+        messages = pruneConversationHistory([
+          ...prior,
+          { role: "assistant", content: [textBlock(record.answerText)] },
+          { role: "user", content: [textBlock(job.prompt)] },
+        ]);
+      } else {
+        const history = await buildHistoryFromMessage(target, discord);
+        messages = pruneConversationHistory([
+          ...history,
+          { role: "user", content: [textBlock(job.prompt)] },
+        ]);
+      }
     }
 
     const prefs = await this.prefs(job.userId);
@@ -297,6 +310,18 @@ export class JobDO extends DurableObject<Env> {
       });
     } catch (err) {
       await live.stop();
+      // Stored history replays Discord CDN URLs that are signed and expire (§6.1).
+      if (
+        !live.hasText &&
+        err instanceof GatewayError &&
+        err.attachmentRejected &&
+        err.status === 400 &&
+        hasUrlSource(messages)
+      ) {
+        await discord.patchOriginal(job.token, MSG_ATTACHMENT_EXPIRED);
+        await this.markAnswered();
+        return null;
+      }
       if (!live.hasText) throw err;
       // Keep what was already streamed rather than replacing it with a bare error.
       console.error("answer failed mid-stream", err);
@@ -313,6 +338,7 @@ export class JobDO extends DurableObject<Env> {
       header,
       ephemeral: job.ephemeral,
       token: job.token,
+      answerText: answer.text,
     });
     return this.costWatch(
       delivered,
@@ -408,6 +434,7 @@ export class JobDO extends DurableObject<Env> {
       header: record.header,
       ephemeral: record.ephemeral,
       token: record.token,
+      answerText: answer.text,
     });
 
     await discord.patchOriginal(
