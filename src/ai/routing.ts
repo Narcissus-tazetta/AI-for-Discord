@@ -102,13 +102,20 @@ export function analyzeTask(
     /^(こんにちは|ありがとう|hello|hi|おはよう)[！!。\s]*$/i.test(prompt) ||
     (prompt.length < 800 && /翻訳|訳して|要約|箇条書き|translate|summari[sz]e/i.test(prompt));
   const search = prefs.web_search && !simple;
-  // The whole history affects difficulty. A short follow-up can still be a hard task.
+  // A short follow-up can continue a hard task, but only the previous user turn counts:
+  // assistant answers and older turns mention these words in passing, and one such hit used
+  // to pin every later turn to the most expensive tier.
+  const previousUser = messages.filter((message) => message.role === "user").at(-2);
   const historyComplex =
-    messages.length > 1 &&
-    /設計|証明|デッドロック|architecture|race condition|prove/i.test(context);
+    !complex &&
+    previousUser !== undefined &&
+    /設計|証明|デッドロック|architecture|race condition|prove/i.test(textOf(previousUser));
+  const strongHint = complex || historyComplex;
   return {
-    tier: complex || historyComplex ? "strong" : simple && !vision && !pdf ? "economy" : "balanced",
-    uncertain: !complex && !historyComplex && !simple,
+    tier: strongHint ? "strong" : simple && !vision && !pdf ? "economy" : "balanced",
+    // A keyword hit is only a hint: a cheap classifier call makes the final decision, and
+    // `strong` stays as the fallback when it cannot run.
+    uncertain: strongHint || !simple,
     vision,
     pdf,
     search,

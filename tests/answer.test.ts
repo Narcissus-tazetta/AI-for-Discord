@@ -151,6 +151,37 @@ describe("answer flow", () => {
       "概算 $0.01130",
     );
   });
+  test("a keyword-triggered strong guess is overruled by the classifier", async () => {
+    const cheap = model({ id: "google/gemini-cheap", reasoning: [{ type: "toggle" }] });
+    const strong = model({
+      id: "anthropic/claude-strong",
+      input: 2e-6,
+      output: 10e-6,
+      reasoning: [{ type: "toggle" }],
+    });
+    const used: string[] = [];
+    spyOn(globalThis, "fetch").mockImplementation((async (_url: string, options?: RequestInit) => {
+      const body = JSON.parse(String(options?.body));
+      used.push(body.model);
+      return json({
+        id: `g${used.length}`,
+        choices: [
+          {
+            message: { content: used.length === 1 ? '{"tier":"economy"}' : "ざっくり説明です。" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 100, completion_tokens: 100 },
+      });
+    }) as any);
+    await askAI(
+      [{ role: "user", content: [{ type: "text", text: "この変数名の設計、ざっくり教えて" }] }],
+      prefs,
+      env,
+      state(approved([cheap, strong])) as any,
+    );
+    expect(used).toEqual([cheap.id, cheap.id]);
+  });
   test("quality priority skips the classifier, since it could not change the choice", async () => {
     let calls = 0;
     spyOn(globalThis, "fetch").mockImplementation((async () => {

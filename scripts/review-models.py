@@ -1,5 +1,10 @@
 """Public catalog research only; no inference calls or credentials.
 Run collect twice, then build and verify with --cache /tmp/discord-full-review.
+
+The review date and output file names are hard-coded. Auto drops every published score 90 days
+after BENCHMARK_REVIEW_DATE (src/models/benchmark-reviews.ts), so a re-review must update
+DATE and the docs/model-review-*.{json,md} names here, that constant, and the file imported by
+tests/benchmark-reviews.test.ts together; build only regenerates benchmark-snapshot.ts.
 """
 import argparse, concurrent.futures, datetime, hashlib, json, math, pathlib, re, urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]

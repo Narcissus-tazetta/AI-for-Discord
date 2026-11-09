@@ -23,7 +23,7 @@ import { money, usdJpyRate, yen } from "../src/shared/currency";
 import { approved, model, prefs } from "./helpers/gateway-fixtures";
 
 describe("routing", () => {
-  test("short follow-ups inherit difficult context", () => {
+  test("a follow-up to a hard previous question is a strong guess left to the classifier", () => {
     const needs = analyzeTask(
       [
         { role: "user", content: "設計を検討して" },
@@ -33,7 +33,25 @@ describe("routing", () => {
       prefs,
     );
     expect(needs.tier).toBe("strong");
-    expect(needs.uncertain).toBe(false);
+    expect(needs.uncertain).toBe(true);
+  });
+  test("difficult words in assistant answers or older turns do not make a turn strong", () => {
+    const needs = analyzeTask(
+      [
+        { role: "user", content: "設計を検討して" },
+        { role: "assistant", content: "設計の案です" },
+        { role: "user", content: "ありがとう" },
+        { role: "assistant", content: "どういたしまして" },
+        { role: "user", content: "ReactのuseStateとは？" },
+      ],
+      prefs,
+    );
+    expect(needs.tier).toBe("balanced");
+  });
+  test("a keyword hit in the latest prompt is a strong guess, not a final tier", () => {
+    const needs = analyzeTask([{ role: "user", content: "複雑な設計" }], prefs);
+    expect(needs.tier).toBe("strong");
+    expect(needs.uncertain).toBe(true);
   });
   test("selects by quality/cost across providers, not fixed provider roles", () => {
     const cheap = model({ id: "google/gemini-cheap" });
