@@ -27,6 +27,13 @@ export interface GatewayResult {
   usageReported: boolean;
 }
 
+export interface DecisionResult {
+  choice: string;
+  /** Billing lookup key, as for chat completions. */
+  generationId: string | null;
+  cost: number | null;
+}
+
 export type GenerationCost = { found: false } | { found: true; cost: number | null };
 
 export class GatewayError extends Error {
@@ -291,6 +298,47 @@ export class GatewayClient {
       data.choices[0].finish_reason,
       message.provider_metadata?.gateway,
     );
+  }
+
+  /** Ask a decision model one multiple-choice question about `input`. */
+  async decideChoice(
+    model: string,
+    input: string,
+    question: { instructions: string; choices: readonly { value: string; description: string }[] },
+  ): Promise<DecisionResult> {
+    let response: Response;
+    try {
+      response = await this.fetcher(`${gatewayBase(this.env)}/decisions`, {
+        method: "POST",
+        headers: this.headers(),
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({
+          model,
+          input,
+          questions: [{ type: "choice", name: "choice", ...question }],
+        }),
+      });
+    } catch (error) {
+      if (isTimeout(error)) throw new GatewayError(504);
+      throw error;
+    }
+    if (!response.ok) throw new GatewayError(response.status);
+    let data: Record<string, any>;
+    try {
+      data = (await response.json()) as Record<string, any>;
+    } catch (error) {
+      if (isTimeout(error)) throw new GatewayError(504);
+      throw new GatewayError(502);
+    }
+    const choice = data?.answers?.[0]?.choice;
+    if (!question.choices.some((option) => option.value === choice)) throw new GatewayError(502);
+    const meta = data.provider_metadata?.gateway;
+    return {
+      choice,
+      generationId:
+        typeof meta?.generationId === "string" && meta.generationId ? meta.generationId : null,
+      cost: costNumber(meta?.cost),
+    };
   }
 
   /** The total includes inference, reasoning, server tools and gateway surcharges. */

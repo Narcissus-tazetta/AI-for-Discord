@@ -70,3 +70,10 @@ export function raw(over: Record<string, unknown> = {}) {
   };
 }
 export const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
+
+/** A `/decisions` reply to the single choice question the classifier asks. */
+export const decision = (choice: string, generationId: string, cost = "0.00001") =>
+  json({
+    answers: [{ type: "choice", name: "choice", choice }],
+    provider_metadata: { gateway: { generationId, cost } },
+  });

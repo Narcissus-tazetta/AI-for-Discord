@@ -4,7 +4,6 @@ import {
   analyzeTask,
   answerPriority,
   answerReasoning,
-  parseClassification,
   planCall,
   rankModels,
   reservationCost,
@@ -117,8 +116,6 @@ describe("routing", () => {
     );
     expect(followUp.urls).toEqual(["https://example.com/page"]);
     expect(followUp.fetchRequired).toBe(false);
-    expect(parseClassification('{"tier":"strong"}')).toEqual({ tier: "strong" });
-    expect(parseClassification('{"tier":"free"}')).toBeNull();
   });
   test("output cap leaves thinking room above the answer budget, trimmed to the allowance", () => {
     const m = model({

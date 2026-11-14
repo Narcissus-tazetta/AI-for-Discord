@@ -13,6 +13,7 @@ import {
   CID_VISIBILITY,
 } from "../src/settings/ui";
 import { context, json, model, registry, setup } from "./helpers/durable-fixtures";
+import { decision } from "./helpers/gateway-fixtures";
 
 describe("Discord delivery and regeneration", () => {
   test("refreshing a recent catalog reveals newly eligible models without paid evaluation", async () => {
@@ -399,6 +400,7 @@ describe("Discord delivery and regeneration", () => {
     const discord = fakeDiscord();
     spyOn(globalThis, "fetch").mockImplementation((async (url: string, options?: RequestInit) => {
       if (url.includes("/generation")) return json({}, 404);
+      if (url.includes("/decisions")) return decision("balanced", "d");
       if (url.includes("/chat/completions"))
         return json({
           id: "g",

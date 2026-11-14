@@ -5,7 +5,7 @@ import { BudgetLedger } from "../src/ai/budget";
 import { GatewayClient, GatewayError } from "../src/ai/gateway";
 import { analyzeTask, rankModels } from "../src/ai/routing";
 import { DAY_MS, evaluationCandidates, isFreeModel, type Registry } from "../src/models/registry";
-import { approved, env, json, model, prefs } from "./helpers/gateway-fixtures";
+import { approved, decision, env, json, model, prefs } from "./helpers/gateway-fixtures";
 
 describe("answer flow", () => {
   test("free errors distinguish provider outages from quality and attachment requirements", () => {
@@ -90,19 +90,19 @@ describe("answer flow", () => {
   test("classifier and answer share one ledger; billed totals replace reservations later", async () => {
     const registry = approved([model({ reasoning: [{ type: "toggle" }] })]);
     const store = state(registry);
+    const decisions: any[] = [];
     const bodies: any[] = [];
-    spyOn(globalThis, "fetch").mockImplementation((async (_url: string, options?: RequestInit) => {
+    spyOn(globalThis, "fetch").mockImplementation((async (url: string, options?: RequestInit) => {
       const body = JSON.parse(String(options?.body));
       expect(new Headers(options?.headers).get("authorization")).toBe("Bearer test-key");
+      if (url.endsWith("/decisions")) {
+        decisions.push(body);
+        return decision("balanced", "d1");
+      }
       bodies.push(body);
       return json({
-        id: `g${bodies.length}`,
-        choices: [
-          {
-            message: { content: bodies.length === 1 ? '{"tier":"balanced"}' : "説明です。" },
-            finish_reason: "stop",
-          },
-        ],
+        id: "g2",
+        choices: [{ message: { content: "説明です。" }, finish_reason: "stop" }],
         usage: { prompt_tokens: 1000, completion_tokens: 500 },
       });
     }) as any);
@@ -112,18 +112,47 @@ describe("answer flow", () => {
       env,
       store as any,
     );
-    expect(bodies).toHaveLength(2);
-    expect(bodies[0].reasoning).toEqual({ enabled: false });
-    expect(bodies[0].tools).toBeUndefined();
-    expect(bodies[1].tool_choice).toBe("auto");
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0].model).toBe("baseten/elephant-1");
+    expect(JSON.parse(decisions[0].input).history.at(-1)).toEqual({
+      role: "user",
+      text: "仕組みを説明して",
+    });
+    expect(decisions[0].questions[0].choices.map((c: any) => c.value)).toEqual([
+      "economy",
+      "balanced",
+      "strong",
+    ]);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].tool_choice).toBe("auto");
     // Gateway reported no tool counts, so the offered search is shown as having run once.
-    expect(costLabel(answer.cost, "usd", 158.1)).toBe("概算 $0.00760");
-    expect(answer.cost.generationIds).toEqual(["g1", "g2"]);
+    expect(costLabel(answer.cost, "usd", 158.1)).toBe("概算 $0.00631");
+    expect(answer.cost.generationIds).toEqual(["d1", "g2"]);
     const pending = store.ledger.pending(10);
-    expect(pending.map((row) => row.generationId)).toEqual(["g1", "g2"]);
+    expect(pending.map((row) => row.generationId)).toEqual(["d1", "g2"]);
     for (const row of pending) store.ledger.resolve(row.id, 0.001);
     expect(store.ledger.summary(Date.now()).total).toBeCloseTo(0.002);
     expect(store.ledger.oldestPending()).toBeNull();
+  });
+  test("an unavailable classifier leaves the heuristic tier and the answer still goes out", async () => {
+    const store = state(approved([model()]));
+    spyOn(globalThis, "fetch").mockImplementation((async (url: string) =>
+      url.endsWith("/decisions")
+        ? json({}, 503)
+        : json({
+            id: "g",
+            choices: [{ message: { content: "説明です。" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 100, completion_tokens: 100 },
+          })) as any);
+    const answer = await askAI(
+      [{ role: "user", content: [{ type: "text", text: "仕組みを説明して" }] }],
+      prefs,
+      env,
+      store as any,
+    );
+    expect(answer.text).toContain("説明です。");
+    expect(answer.cost.generationIds).toEqual(["g"]);
+    expect(answer.cost.unknown).toBe(true);
   });
   test("cost shown includes server tools, preferring Gateway's own figures", async () => {
     const answerWith = async (gateway: Record<string, unknown>) => {
@@ -160,17 +189,12 @@ describe("answer flow", () => {
       reasoning: [{ type: "toggle" }],
     });
     const used: string[] = [];
-    spyOn(globalThis, "fetch").mockImplementation((async (_url: string, options?: RequestInit) => {
-      const body = JSON.parse(String(options?.body));
-      used.push(body.model);
+    spyOn(globalThis, "fetch").mockImplementation((async (url: string, options?: RequestInit) => {
+      if (url.endsWith("/decisions")) return decision("economy", "d");
+      used.push(JSON.parse(String(options?.body)).model);
       return json({
-        id: `g${used.length}`,
-        choices: [
-          {
-            message: { content: used.length === 1 ? '{"tier":"economy"}' : "ざっくり説明です。" },
-            finish_reason: "stop",
-          },
-        ],
+        id: "g",
+        choices: [{ message: { content: "ざっくり説明です。" }, finish_reason: "stop" }],
         usage: { prompt_tokens: 100, completion_tokens: 100 },
       });
     }) as any);
@@ -180,7 +204,7 @@ describe("answer flow", () => {
       env,
       state(approved([cheap, strong])) as any,
     );
-    expect(used).toEqual([cheap.id, cheap.id]);
+    expect(used).toEqual([cheap.id]);
   });
   test("quality priority skips the classifier, since it could not change the choice", async () => {
     let calls = 0;

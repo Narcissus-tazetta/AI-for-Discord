@@ -6,6 +6,39 @@ import { MAX_ATTACHMENT_BYTES, MAX_TOTAL_ATTACHMENT_BYTES } from "../src/shared/
 import { env, json, model } from "./helpers/gateway-fixtures";
 
 describe("Gateway protocol", () => {
+  test("decision choice: sends typed question, returns the choice with its billing id", async () => {
+    let sent: any;
+    const client = new GatewayClient(env, (async (url: string, init: RequestInit) => {
+      expect(url).toBe("https://mock.invalid/v1/decisions");
+      sent = JSON.parse(init.body as string);
+      return json({
+        answers: [{ type: "choice", name: "choice", choice: "strong" }],
+        provider_metadata: { gateway: { generationId: "gen_1", cost: "0.000003" } },
+      });
+    }) as any);
+    const question = {
+      instructions: "q",
+      choices: [
+        { value: "economy", description: "a" },
+        { value: "strong", description: "b" },
+      ],
+    };
+    expect(await client.decideChoice("vendor/decider", "text", question)).toEqual({
+      choice: "strong",
+      generationId: "gen_1",
+      cost: 0.000003,
+    });
+    expect(sent).toEqual({
+      model: "vendor/decider",
+      input: "text",
+      questions: [{ type: "choice", name: "choice", ...question }],
+    });
+    const unknownChoice = new GatewayClient(env, (async () =>
+      json({ answers: [{ choice: "free" }] })) as any);
+    await expect(unknownChoice.decideChoice("vendor/decider", "t", question)).rejects.toThrow(
+      "HTTP 502",
+    );
+  });
   test("converts stored image and PDF URL blocks to chat parts", () => {
     const chat = toChatMessages([
       {

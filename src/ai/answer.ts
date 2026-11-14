@@ -6,6 +6,7 @@ import {
   isFreeModel,
   type ModelInfo,
   type Registry,
+  type Tier,
 } from "../models/registry";
 import { type Env, MSG_NO_TEXT, maxTokens } from "../shared/constants";
 import { type Currency, money } from "../shared/currency";
@@ -14,6 +15,7 @@ import { AnthropicClient, anthropicModelId } from "./anthropic";
 import { BudgetError, type BudgetKind, positiveSetting } from "./budget";
 import {
   type ChatMessage,
+  type DecisionResult,
   GatewayClient,
   GatewayError,
   type GatewayResult,
@@ -23,14 +25,16 @@ import {
   analyzeTask,
   answerPriority,
   answerReasoning,
-  classifierMessages,
+  CLASSIFIER_MODEL,
+  CLASSIFIER_RESERVE_USD,
+  classifierInput,
   estimateCost,
-  parseClassification,
   planCall,
   rankModels,
   reservationCost,
   serverTools,
   type TaskNeeds,
+  TIER_QUESTION,
   toolCost,
 } from "./routing";
 
@@ -216,6 +220,50 @@ export class PaidCalls {
     return result;
   }
 
+  /** Classify the request's difficulty; billed and ledgered like any other call. */
+  async decideTier(input: string): Promise<Tier> {
+    const reservation = CLASSIFIER_RESERVE_USD;
+    if (reservation > this.remaining)
+      throw new BudgetError(
+        "この回答の費用見積もりが上限を超えました。質問を短くするか上限を調整してください。",
+      );
+    const id = crypto.randomUUID();
+    await this.state.reserveSpend(id, reservation, this.kind);
+    this.charged += reservation;
+    let result: DecisionResult;
+    try {
+      result = await this.gateway.decideChoice(CLASSIFIER_MODEL, input, TIER_QUESTION);
+    } catch (error) {
+      const cost = error instanceof GatewayError && error.definitelyUnbilled ? 0 : null;
+      await this.state.settleSpend(id, cost);
+      if (cost === 0) this.charged -= reservation;
+      else this.unknown = true;
+      throw error;
+    }
+    if (result.generationId) {
+      await this.state.deferSpend(id, result.generationId);
+      this.generationIds.push(result.generationId);
+    } else {
+      await this.state.settleSpend(id, null);
+      this.unrecorded = true;
+    }
+    const spent = result.cost ?? reservation;
+    this.charged += Math.min(reservation, spent) - reservation;
+    this.estimated += spent;
+    console.log(
+      JSON.stringify({
+        event: "ai_usage",
+        kind: this.kind,
+        model: CLASSIFIER_MODEL,
+        generationId: result.generationId,
+        estimatedUsd: spent,
+        provider: "gateway",
+        gatewayCost: result.cost !== null,
+      }),
+    );
+    return result.choice as Tier;
+  }
+
   private async call(
     model: ModelInfo,
     messages: ChatMessage[],
@@ -284,60 +332,30 @@ export async function askAI(
   const output = maxTokens(env);
 
   const heuristicTier = needs.tier;
-  let classifiedTier: string | null = null;
+  let classifiedTier: Tier | null = null;
   // Under "high" every tier gets the same score floor and score-first ordering, so the
   // classification could not change the pick.
-  if (automatic && !freeOnly && needs.uncertain && priority !== "high") {
-    const classifierNeeds: TaskNeeds = {
-      ...needs,
-      tier: "economy",
-      uncertain: false,
-      vision: false,
-      pdf: false,
-      search: false,
-      urls: [],
-      fetchRequired: false,
-      inputTokens: 8192,
-    };
-    const off = { thinking: false, effort: "low" };
-    const budget = Math.min(0.01, calls.remaining / 4);
-    // A model that must think can spend the whole 128-token cap on reasoning and return nothing.
-    const classifier = rankModels(
-      registry,
-      classifierNeeds,
-      128,
-      budget,
-      "auto",
-      Date.now(),
-      "low",
-      off,
-    )
-      .map((model) => ({ model, plan: planCall(model, off, 128, classifierNeeds, budget) }))
-      .find(({ plan }) => plan?.level === "none");
-    if (classifier?.plan) {
-      await progress?.status("🧭 質問の内容を確認しています");
-      try {
-        const result = await calls.complete(
-          classifier.model,
-          classifierMessages(chat, needs),
-          classifier.plan.maxTokens,
-          classifier.plan.options,
-          classifierNeeds,
-        );
-        const classification =
-          result.finishReason === "stop" ? parseClassification(result.text) : null;
-        if (classification) {
-          needs.tier = classification.tier;
-          classifiedTier = classification.tier;
-        }
-      } catch (error) {
-        // Authentication/balance/unknown transport failures must not trigger more billable work.
-        if (
-          !(error instanceof BudgetError) &&
-          !(error instanceof GatewayError && error.canFallback)
-        )
-          throw error;
-      }
+  if (
+    automatic &&
+    !freeOnly &&
+    needs.uncertain &&
+    priority !== "high" &&
+    CLASSIFIER_RESERVE_USD <= calls.remaining / 4
+  ) {
+    await progress?.status("🧭 質問の内容を確認しています");
+    try {
+      classifiedTier = await calls.decideTier(classifierInput(chat, needs));
+      needs.tier = classifiedTier;
+    } catch (error) {
+      // Authentication/balance/unknown transport failures must not trigger more billable work.
+      if (!(error instanceof BudgetError) && !(error instanceof GatewayError && error.canFallback))
+        throw error;
+      console.log(
+        JSON.stringify({
+          event: "classifier_failed",
+          status: error instanceof GatewayError ? error.status : "budget",
+        }),
+      );
     }
   }
 
