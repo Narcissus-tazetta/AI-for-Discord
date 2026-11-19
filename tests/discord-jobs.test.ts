@@ -289,6 +289,8 @@ describe("Discord delivery and regeneration", () => {
       const payload =
         options?.body instanceof FormData ? options.body.get("payload_json") : options?.body;
       const body = payload ? JSON.parse(String(payload)) : null;
+      const after = url.match(/\/channels\/[^/]+\/messages\?after=(\d+)&limit=100$/);
+      if (after) return json([...messages.values()].filter((message) => +message.id > +after[1]));
       const channelMatch = url.match(/channels\/([^/?]+)\/messages\/([^?]+)/);
       if (channelMatch) {
         const [, , msgId] = channelMatch;
@@ -524,10 +526,16 @@ describe("Discord delivery and regeneration", () => {
 
     expect(discord.messages.has("1")).toBe(true);
     expect(discord.messages.has("2")).toBe(true);
-    expect(discord.messages.get("1").attachments[0].filename).toBe("answer-source.md");
+    expect(discord.messages.get("1").attachments).toEqual([]);
     expect(
       discord.messages.get("2").attachments.map((file: { filename: string }) => file.filename),
-    ).toEqual(["table-1.png", "table-1.csv"]);
+    ).toEqual(["table-1.png"]);
+    expect(
+      discord.messages.get("3").attachments.map((file: { filename: string }) => file.filename),
+    ).toEqual(["table-1.csv", "answer-source.md"]);
+    await slashJob.alarm();
+    expect(discord.messages.get("3").content).toMatch(/｜費用 ¥0\.16$/);
+    expect(discord.messages.get("3").attachments).toHaveLength(2);
     const rec1 = state.getRegenRecord("2");
     expect(rec1?.answerText).toBe(tableAnswer);
 
@@ -560,7 +568,7 @@ describe("Discord delivery and regeneration", () => {
       content: [{ type: "text", text: "人口は？" }],
     });
 
-    const rec2 = state.getRegenRecord("3");
+    const rec2 = state.getRegenRecord("4");
     expect(rec2?.answerText).toBe("日本の首都は東京で、人口は約1400万人です。");
   });
 
@@ -723,7 +731,7 @@ describe("Discord delivery and regeneration", () => {
     expect(turn3Messages[0].content[0].text).toContain("（以前のメッセージのため省略）");
   });
 
-  test.each(["text", "source", "linked", "missing-original", "csv", "missing"])(
+  test.each(["text", "source", "linked", "later", "missing-original", "csv", "missing"])(
     "continues without a cache using %s",
     async (mode) => {
       const { state, env, kv, ready } = setup();
@@ -735,7 +743,7 @@ describe("Discord delivery and regeneration", () => {
       const table = "| 商品 | 在庫 |\n| --- | --- |\n| りんご | 12 |\n\n-# 回答に元からある注記";
       const csv = '\uFEFF"商品","在庫"\r\n"りんご","12"\r\n';
       const followup = mode === "linked" || mode === "missing-original";
-      const sourceMode = mode === "source" || mode === "linked";
+      const sourceMode = mode === "source" || mode === "linked" || mode === "later";
       const file = sourceMode ? "answer-source.md" : "table-1.csv";
       const attachment = `https://cdn.discordapp.com/attachments/1/2/${file}?ex=1`;
       const exported = sourceMode ? header + table : csv;
@@ -754,12 +762,21 @@ describe("Discord delivery and regeneration", () => {
           attachments: files,
         });
       }
+      if (mode === "later") {
+        discord.messages.set("100", {
+          id: "100",
+          channel_id: "channel",
+          author: { id: "app" },
+          attachments: files,
+          interaction_metadata: { original_response_message_id: "99" },
+        });
+      }
       discord.messages.set("99", {
         id: "99",
         channel_id: "channel",
         author: { id: "app" },
         content: `${visible}\n\n-# モデル: auto`,
-        attachments: mode === "text" || followup ? [] : files,
+        attachments: mode === "text" || mode === "later" || followup ? [] : files,
         ...(followup ? { interaction_metadata: { original_response_message_id: "98" } } : {}),
       });
       const chatRequests: any[] = [];

@@ -8,14 +8,16 @@ import type { AnswerTable } from "./tables";
 const MIN_WIDTH = 336;
 const MIN_COLUMN_WIDTH = 64;
 const MAX_COLUMN_WIDTH = 224;
-const MAX_HEIGHT = 520;
+const MAX_IMAGE_HEIGHT = 4096;
 const MAX_IMAGE_PIXELS = 3_000_000;
 const SCALE = 2;
+const DETAILED_SCALE = 3;
 const FONT_SIZE = 14;
 const LINE_HEIGHT = 21;
 const PADDING = 10;
 const PREVIEW_WIDTH = 320;
 const MIN_PREVIEW_FONT_SIZE = 11;
+const MAX_PREVIEW_TABLE_WIDTH = Math.floor((FONT_SIZE * PREVIEW_WIDTH) / MIN_PREVIEW_FONT_SIZE);
 const words = new Intl.Segmenter("ja", { granularity: "word" });
 const graphemes = new Intl.Segmenter();
 const family = "Discord Table Sans";
@@ -69,6 +71,12 @@ function columnWidths(rows: string[][], count: number): number[] {
     return Math.max(MIN_COLUMN_WIDTH, Math.min(MAX_COLUMN_WIDTH, content + PADDING * 2 + 2));
   });
   const total = widths.reduce((sum, width) => sum + width, 0);
+  const minimum = count * MIN_COLUMN_WIDTH;
+  if (minimum <= MAX_PREVIEW_TABLE_WIDTH && total > MAX_PREVIEW_TABLE_WIDTH) {
+    // Keep narrow columns usable while long cells wrap instead of shrinking the preview text.
+    const ratio = (MAX_PREVIEW_TABLE_WIDTH - minimum) / (total - minimum);
+    return widths.map((width) => MIN_COLUMN_WIDTH + Math.floor((width - MIN_COLUMN_WIDTH) * ratio));
+  }
   widths[0] += Math.max(0, MIN_WIDTH - total);
   return widths;
 }
@@ -78,12 +86,14 @@ function tableSvg(
   widths: number[],
   align: AnswerTable["align"],
   limit: number,
-): string[] | null {
+): { svg: string; height: number }[] | null {
   const positions = [0];
   for (const width of widths) positions.push(positions[positions.length - 1] + width);
   const tableWidth = positions[positions.length - 1];
   // Shorten pages as tables get wider so the RGBA allocation stays bounded at 2× resolution.
-  const maxHeight = Math.min(MAX_HEIGHT, Math.floor(MAX_IMAGE_PIXELS / (tableWidth * SCALE ** 2)));
+  const maxHeight = Math.floor(
+    Math.min(MAX_IMAGE_HEIGHT / SCALE, MAX_IMAGE_PIXELS / (tableWidth * SCALE ** 2)),
+  );
   if (maxHeight < LINE_HEIGHT + PADDING * 2) return null;
   const data = rows.slice(1);
   const anchors = widths.map((_, i) => {
@@ -102,8 +112,6 @@ function tableSvg(
   );
 
   function rowSvg(index: number, y: number): string {
-    const height = heights[index];
-    const background = index === 0 ? "#252f59" : index % 2 === 1 ? "#141b2e" : "#1a233b";
     const cells = wrapped[index].map((cell, column) => {
       const anchor = anchors[column];
       const start = positions[column];
@@ -114,30 +122,27 @@ function tableSvg(
           : anchor === "end"
             ? start + width - PADDING
             : start + PADDING;
-      const color = index === 0 ? "#dce2ff" : "#f3f6ff";
       return cell
         .map(
           (text, line) =>
-            `<text x="${x}" y="${y + PADDING + FONT_SIZE + line * LINE_HEIGHT}" text-anchor="${anchor}" fill="${color}" xml:space="preserve">${escapeXml(text)}</text>`,
+            `<text x="${x}" y="${y + PADDING + FONT_SIZE + line * LINE_HEIGHT}" text-anchor="${anchor}" xml:space="preserve">${escapeXml(text)}</text>`,
         )
         .join("");
     });
-    return `<rect y="${y}" width="${tableWidth}" height="${height}" fill="${background}"/>${cells.join("")}`;
+    const rule = index > 0 ? `<path d="M0 ${y}H${tableWidth}" stroke="#36393f"/>` : "";
+    return rule + cells.join("");
   }
 
   if (heights[0] > maxHeight) return null;
   const header = rowSvg(0, 0);
-  const pages: string[] = [];
+  const pages: { svg: string; height: number }[] = [];
   let height = heights[0];
   let content = header;
   const finishPage = () => {
-    const rules = positions
-      .slice(1, -1)
-      .map((x) => `M${x} 0V${height}`)
-      .join("");
-    pages.push(
-      `<svg xmlns="http://www.w3.org/2000/svg" width="${tableWidth}" height="${height}" viewBox="0 0 ${tableWidth} ${height}"><defs><clipPath id="frame"><rect width="${tableWidth}" height="${height}" rx="10"/></clipPath></defs><g clip-path="url(#frame)" font-family="${family}" font-size="${FONT_SIZE}">${content}<path d="${rules}" fill="none" stroke="#435172" stroke-opacity="0.55"/></g></svg>`,
-    );
+    pages.push({
+      svg: `<svg xmlns="http://www.w3.org/2000/svg" width="${tableWidth}" height="${height}" viewBox="0 0 ${tableWidth} ${height}"><rect width="${tableWidth}" height="${height}" fill="#202225"/><rect width="${tableWidth}" height="${heights[0]}" fill="#2b2d31"/><g font-family="${family}" font-size="${FONT_SIZE}" fill="#f2f3f5">${content}</g></svg>`,
+      height,
+    });
   };
   for (let index = 1; index < rows.length; index++) {
     if (heights[0] + heights[index] > maxHeight) return null;
@@ -192,7 +197,7 @@ export async function presentTable(
     description: `表 ${number} のデータ`,
     data: new Blob([csv(table.rows, count)], { type: "text/csv; charset=utf-8" }),
   });
-  if (FONT_SIZE * PREVIEW_WIDTH < MIN_PREVIEW_FONT_SIZE * width) {
+  if (width > MAX_PREVIEW_TABLE_WIDTH) {
     return { kind: "list", csv: csvFile() };
   }
   if (!pageLimit) return null;
@@ -201,23 +206,24 @@ export async function presentTable(
 
   initialized ??= initWasm(wasm);
   await initialized;
-  const pages = drawings.map((drawing, index) => {
-    const renderer = new Resvg(drawing, {
+  const detailed = drawings.every(
+    ({ height }) =>
+      height * DETAILED_SCALE <= MAX_IMAGE_HEIGHT &&
+      width * height * DETAILED_SCALE ** 2 <= MAX_IMAGE_PIXELS,
+  );
+  const pages = drawings.map(({ svg }, index) => {
+    const renderer = new Resvg(svg, {
       font: { fontBuffers: [new Uint8Array(font)], defaultFontFamily: family },
-      fitTo: { mode: "zoom", value: SCALE },
+      fitTo: { mode: "zoom", value: detailed ? DETAILED_SCALE : SCALE },
     });
     try {
       const image = renderer.render();
       try {
-        const files = [
-          {
-            filename: `${filename}${drawings.length > 1 ? `-${index + 1}` : ""}.png`,
-            description: `表 ${number}${drawings.length > 1 ? `（${index + 1}/${drawings.length}）` : ""}。表データは ${filename}.csv を参照。`,
-            data: new Blob([image.asPng().slice()], { type: "image/png" }),
-          },
-        ];
-        if (index === 0) files.push(csvFile());
-        return files;
+        return {
+          filename: `${filename}${drawings.length > 1 ? `-${index + 1}` : ""}.png`,
+          description: `表 ${number}${drawings.length > 1 ? `（${index + 1}/${drawings.length}）` : ""}。表データは回答末尾の ${filename}.csv を参照。`,
+          data: new Blob([image.asPng().slice()], { type: "image/png" }),
+        };
       } finally {
         image.free();
       }
@@ -225,9 +231,9 @@ export async function presentTable(
       renderer.free();
     }
   });
-  return { kind: "image", pages };
+  return { kind: "image", pages, csv: csvFile() };
 }
 
 export type TablePresentation =
-  | { kind: "image"; pages: DiscordUpload[][] }
+  | { kind: "image"; pages: DiscordUpload[]; csv: DiscordUpload }
   | { kind: "list"; csv: DiscordUpload };

@@ -117,6 +117,8 @@ async function recoverBotAnswer(
   const files = message.attachments ?? [];
   let source = files.find(({ filename }) => filename === ANSWER_SOURCE_FILENAME);
   const originalId = message.interaction_metadata?.original_response_message_id;
+  const marker = /^\*\*表 (\d+)(?:（\d+\/\d+）)?\*\*$/gm;
+  const numbers = new Set(Array.from(text.matchAll(marker), (match) => match[1]));
   let missing = false;
   if (!source && originalId) {
     try {
@@ -128,15 +130,35 @@ async function recoverBotAnswer(
       console.log(`history: answer source message unavailable (${error.status})`);
     }
   }
+  const startsAnswer = text.startsWith("**Q:**") && !/^-# モデル: /m.test(text);
+  const hasLocalTables = [...numbers].every((number) =>
+    files.some(({ filename }) => filename === `table-${number}.csv`),
+  );
+  if (!source && (startsAnswer || !hasLocalTables)) {
+    const anchor = originalId ?? message.id;
+    try {
+      const followups = await discord.fetchMessagesAfter(message.channel_id, anchor);
+      source = followups
+        .filter(
+          (followup) =>
+            followup.author?.id === discord.appId &&
+            followup.interaction_metadata?.original_response_message_id === anchor,
+        )
+        .flatMap((followup) => followup.attachments ?? [])
+        .find(({ filename }) => filename === ANSWER_SOURCE_FILENAME);
+    } catch (error) {
+      if (!(error instanceof DiscordError) || ![403, 404].includes(error.status)) throw error;
+      missing ||= !hasLocalTables;
+      console.log(`history: answer followups unavailable (${error.status})`);
+    }
+  }
   if (source) {
     const content = await readAnswerSource(source);
     const parsed = content && parseBotAnswer(content, true);
     if (parsed) return { text: content, parsed };
   }
 
-  // The CSV belongs to the first image page, while later pages need the original response.
-  const marker = /^\*\*表 (\d+)(?:（\d+\/\d+）)?\*\*$/gm;
-  const numbers = new Set(Array.from(text.matchAll(marker), (match) => match[1]));
+  // Previously delivered tables can still carry the CSV beside the image.
   const tables = new Map<string, string>();
   for (const number of numbers) {
     const file = files.find(({ filename }) => filename === `table-${number}.csv`);

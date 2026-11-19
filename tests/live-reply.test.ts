@@ -92,61 +92,120 @@ test("falls back to aligned text when the table upload is rejected", async () =>
 test("uploads PNG and protected CSV on completion and clears them when regenerated", async () => {
   const forms: FormData[] = [];
   const edits: Record<string, unknown>[] = [];
-  spyOn(globalThis, "fetch").mockImplementation((async (_url: string, init?: RequestInit) => {
+  spyOn(globalThis, "fetch").mockImplementation((async (url: string, init?: RequestInit) => {
     const body = init?.body;
     if (body instanceof FormData) forms.push(body);
     else edits.push(JSON.parse(String(body)));
-    return Response.json({ id: "1" });
+    return Response.json({ id: init?.method === "POST" || url.endsWith("/2") ? "2" : "1" });
   }) as typeof fetch);
   const discord = new DiscordClient(env);
   const header = "**Q:** 在庫\n\n**A:**\n";
   const body = "| 商品 | 価格 |\n| --- | ---: |\n| りんご | 100円 |\n| =1+1 | -3 |";
   const reply = new LiveReply(discord, "tok", true, header);
   const delivered = await reply.finish(body, [], "-# モデル: test");
-  expect(forms).toHaveLength(1);
+  expect(forms).toHaveLength(2);
   expect(reply.text).toBe("");
-  const [form] = forms;
+  const [form, footerForm] = forms;
   const payload = JSON.parse(String(form.get("payload_json")));
   expect(payload.content).toContain("**表 1**");
   expect(payload.content).not.toContain("| 商品");
   expect(payload.attachments.map((file: { filename: string }) => file.filename)).toEqual([
     "table-1.png",
+  ]);
+  const footer = JSON.parse(String(footerForm.get("payload_json")));
+  expect(footer.content).toBe("-# モデル: test");
+  expect(footer.attachments.map((file: { filename: string }) => file.filename)).toEqual([
     "table-1.csv",
     "answer-source.md",
   ]);
   const image = form.get("files[0]") as File;
   const png = new Uint8Array(await image.arrayBuffer());
   expect(Array.from(png.slice(0, 8))).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
-  const file = form.get("files[1]") as File;
+  const file = footerForm.get("files[0]") as File;
   expect(await file.text()).toContain('"りんご","100円"\r\n"\'=1+1","-3"');
-  expect(await (form.get("files[2]") as File).text()).toBe(header + body);
+  expect(await (footerForm.get("files[1]") as File).text()).toBe(header + body);
 
   await new LiveReply(discord, "tok", true, header, delivered.ids).finish("りんごなし", []);
-  expect(edits[0].attachments).toEqual([]);
+  expect(edits.map(({ attachments }) => attachments)).toEqual([[], []]);
 });
 
 test("keeps six columns together and only paginates the rows", async () => {
   const body = [
     "| 商品 | 在庫 | 価格 | 倉庫 | 入荷 | メモ |",
     "| --- | --- | --- | --- | --- | --- |",
-    ...Array.from({ length: 13 }, (_, i) => `| 商品 ${i + 1} | 12 | 150円 | 東京 | 11/20 | 通常 |`),
+    ...Array.from({ length: 70 }, (_, i) => `| 商品 ${i + 1} | 12 | 150円 | 東京 | 11/20 | 通常 |`),
   ].join("\n");
   const [table] = parseTables(body);
   const presentation = await presentTable(table, 1, 4);
   if (presentation?.kind !== "image") throw new Error("expected an image table");
   const { pages } = presentation;
-  expect(pages.map((page) => page.map((file) => file.filename))).toEqual([
-    ["table-1-1.png", "table-1.csv"],
-    ["table-1-2.png"],
-  ]);
-  const images = await Promise.all(pages.map(([file]) => file.data.arrayBuffer()));
+  expect(pages.map((page) => page.filename)).toEqual(["table-1-1.png", "table-1-2.png"]);
+  const images = await Promise.all(pages.map((file) => file.data.arrayBuffer()));
   const widths = images.map((image) => new DataView(image).getUint32(16));
   expect(widths[0]).toBeGreaterThan(672);
   expect(widths[1]).toBe(widths[0]);
-  expect(await pages[0][1].data.text()).toContain('"商品 13","12","150円","東京","11/20","通常"');
+  expect(await presentation.csv.data.text()).toContain(
+    '"商品 70","12","150円","東京","11/20","通常"',
+  );
 });
 
-test("shows wide comparisons as a list with a CSV and attaches the answer source once", async () => {
+test("uploads one tall table image with long Japanese cell text", async () => {
+  const messages: { content: string; attachments?: { filename: string }[] }[] = [];
+  spyOn(globalThis, "fetch").mockImplementation((async (_url: string, init?: RequestInit) => {
+    const raw = init?.body instanceof FormData ? init.body.get("payload_json") : init?.body;
+    messages.push(JSON.parse(String(raw)));
+    return Response.json({ id: String(messages.length) });
+  }) as typeof fetch);
+  const body = [
+    "| 項目 | Gemini 4 Neonの内容 | 凄さのポイント |",
+    "| --- | --- | --- |",
+    "| コンテキストウィンドウ | 入力と出力（思考・関数呼び出し・最終回答を含む）で合計1,048,576トークン | 大量の文書・表計算・ログをまとめて扱える |",
+    "| 長文出力 | 同期出力は1回あたり65,536トークン、バックグラウンド実行や継続トークンで最大1Mトークンまで | 大規模なコードや分析レポートを途切れず生成できる |",
+    "| 思考レベル | low / medium / high（デフォルト）/ xhigh の4段階 | 速度・コスト・推論の深さを用途に応じて調整できる |",
+    "| 知能指数 | Artificial Analysis Intelligence Index で61点、総合3位（xhigh設定時） | 上位モデルの一角に入る水準 |",
+    "| コーディング | Artificial Analysis Coding Agent Index（58.6）で1位、Zapier AutomationBench（56.3%）で1位 | リポジトリ単位のデバッグや複数ファイルのリファクタリングに強いとされる |",
+    "| コスト効率 | デフォルト設定でGemini 4 Carbonより1タスクあたりのコストが32%低い | 日常的なエージェント処理を回しやすい |",
+    "| 価格 | 入力$3.00 / 100万トークン、出力$15.00 / 100万トークン、キャッシュ入力は95%割引（$0.15） | 高性能モデルとしては比較的手頃な設定 |",
+    "| ハルシネーション | 社内テストで「これまでで最も低い捏造率」と発表 | 長いエージェントセッションでの信頼性向上をうたう |",
+    "| 長いセッション | 冗長なファイル読み込みを減らし、コンテキスト圧縮を確実に処理 | 多数のツール呼び出しを伴う作業でも安定しやすい |",
+    "| マルチモデル連携 | Hydrogen（高速・大量処理向け）と組み合わせ、Neonが計画、Hydrogenが実行を担当 | 高度な判断と高速処理を両立できる |",
+    "| 位置づけ | Hydrogen（日常的な高頻度処理）とCarbon（長期・超複雑タスク）の中間 | 用途に応じた使い分けがしやすい |",
+    "",
+    "出典：[資料](https://example.com/reference)",
+  ].join("\n");
+  const reply = new LiveReply(new DiscordClient(env), "tok", false, "**A:**\n");
+  const delivered = await reply.finish(body, [], "-# モデル: test");
+  expect(messages.map(({ attachments }) => attachments?.map(({ filename }) => filename))).toEqual([
+    ["table-1.png"],
+    ["table-1.csv", "answer-source.md"],
+  ]);
+  expect(delivered.lastContent).toEndWith("-# モデル: test");
+  expect(delivered.lastContent).toContain("出典：[資料]");
+});
+
+test("keeps all five columns of a fruit comparison in the table image", async () => {
+  const body = [
+    "| 果物 | 主な産地 | 旬の時期 | 価格帯 | 特徴 |",
+    "| --- | --- | --- | --- | --- |",
+    "| りんご | 青森県、長野県 | 9月〜12月 | 中 | 食物繊維が多く、保存がききやすい |",
+    "| みかん | 和歌山県、愛媛県 | 11月〜2月 | 低〜中 | ビタミンCが豊富で、冬のこたつのお供 |",
+    "| いちご | 栃木県、福岡県 | 12月〜5月 | 中〜高 | 甘みと香りが強く、生食向き |",
+    "| バナナ | フィリピン、エクアドル | 通年 | 低 | 手軽に食べられ、エネルギー補給に向く |",
+    "| ぶどう | 山梨県、長野県 | 8月〜10月 | 高 | 皮ごと食べられる品種もあり、贈答品にも人気 |",
+  ].join("\n");
+  const [table] = parseTables(body);
+  const presentation = await presentTable(table, 1, 4);
+  expect(presentation?.kind).toBe("image");
+  if (presentation?.kind !== "image") return;
+  const [png] = presentation.pages;
+  const image = new DataView(await png.data.arrayBuffer());
+  expect(image.getUint32(16)).toBeGreaterThan(1000);
+  expect(await presentation.csv.data.text()).toContain(
+    '"ぶどう","山梨県、長野県","8月〜10月","高","皮ごと食べられる品種もあり、贈答品にも人気"',
+  );
+});
+
+test("shows tables that exceed the minimum column widths as a list with a CSV", async () => {
   const edits: { content: string; attachments?: { filename: string }[] }[] = [];
   spyOn(globalThis, "fetch").mockImplementation((async (_url: string, init?: RequestInit) => {
     const raw = init?.body instanceof FormData ? init.body.get("payload_json") : init?.body;
@@ -155,9 +214,9 @@ test("shows wide comparisons as a list with a CSV and attaches the answer source
   }) as typeof fetch);
   const details = "説明が長くなる場合にもスマホで比較できる";
   const body = [
-    "| プラン | 対象 | 利点 | 制約 |",
-    "| --- | --- | --- | --- |",
-    `| 標準 | ${details} | ${details} | ${details} |`,
+    "| プラン | 対象 | 利点 | 制約 | 料金 | 枠 | 備考 |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
+    `| 標準 | ${details} | ${details} | ${details} | 無料 | なし | なし |`,
     "",
     "まとめ",
   ].join("\n");
@@ -165,11 +224,10 @@ test("shows wide comparisons as a list with a CSV and attaches the answer source
   const delivered = await reply.finish(body, [], "-# モデル: test");
   expect(edits.map(({ attachments }) => attachments?.map(({ filename }) => filename))).toEqual([
     ["table-1.csv", "answer-source.md"],
-    undefined,
   ]);
   expect(edits[0].content).toContain(`**プラン：標準**\n- 対象：${details}`);
-  expect(edits[1].content).toStartWith("まとめ\n\n");
-  expect(delivered.lastContent).toBe(edits[1].content);
+  expect(edits[0].content).toEndWith("まとめ\n\n-# モデル: test");
+  expect(delivered.lastContent).toBe(edits[0].content);
 });
 
 test("suppresses Discord link previews when table formatting moves citations to a followup", async () => {

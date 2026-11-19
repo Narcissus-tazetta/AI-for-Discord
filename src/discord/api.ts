@@ -199,6 +199,15 @@ export class DiscordClient {
       headers: { authorization: `Bot ${this.botToken}` },
     });
   }
+
+  fetchMessagesAfter(channelId: string, messageId: string): Promise<DiscordMessage[]> {
+    return this.request(
+      `${this.base}/channels/${channelId}/messages?after=${messageId}&limit=100`,
+      {
+        headers: { authorization: `Bot ${this.botToken}` },
+      },
+    );
+  }
 }
 
 const JSON_HEADERS = { "content-type": "application/json" };

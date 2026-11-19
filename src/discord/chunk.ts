@@ -67,20 +67,16 @@ export function chunkAnswer(
     for (const part of chunkText(before.trimEnd())) append(part);
     const presentation = presentations?.get(table);
     if (presentation?.kind === "image") {
-      for (const [page, files] of presentation.pages.entries()) {
+      for (const [page, image] of presentation.pages.entries()) {
         const part =
           presentation.pages.length > 1 ? `（${page + 1}/${presentation.pages.length}）` : "";
-        append(`**表 ${index + 1}${part}**`, files);
+        append(`**表 ${index + 1}${part}**`, [image]);
       }
     } else {
       if (presentation?.kind === "list") append(`**表 ${index + 1}**`);
       else if (presentations) append(`-# 表 ${index + 1} はテキストで表示しています。`);
-      let csv = presentation?.csv;
       for (const page of renderTextTable(table, presentation?.kind === "list")) {
-        for (const part of chunkText(page)) {
-          append(part, csv ? [csv] : undefined);
-          csv = undefined;
-        }
+        for (const part of chunkText(page)) append(part);
       }
     }
     start = table.end;
@@ -88,7 +84,7 @@ export function chunkAnswer(
   for (const part of chunkText(body.slice(start).replace(/^(?:\r?\n)+/, ""))) append(part);
   if (footer !== undefined) {
     const last = chunks[chunks.length - 1];
-    const joined = footerContent(last.content, footer);
+    const joined = last.files ? null : footerContent(last.content, footer);
     if (joined === null) chunks.push({ content: footer });
     else last.content = joined;
   }

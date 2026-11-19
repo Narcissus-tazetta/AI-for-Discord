@@ -41,6 +41,7 @@ const STATUS_FRAME_MS = 1000;
 const TICK_MS = 250;
 const CURSOR = " ▌";
 const MAX_TABLE_IMAGES = 4;
+const MAX_DISCORD_ATTACHMENTS = 10;
 // Final table layout can move a citation to a different message while Discord still has the old preview.
 const SUPPRESS_EMBEDS = 1 << 2;
 
@@ -150,7 +151,12 @@ export class LiveReply {
     const source = tables.length ? answerSource(this.header, body) : null;
     const presentations = source ? await this.prepareTables(tables) : new Map();
     const chunks = chunkAnswer(this.header, body, footer, tables, presentations);
-    if (source && presentations.size) chunks[0].files = [...(chunks[0].files ?? []), source];
+    if (source && presentations.size) {
+      const exports = [...presentations.values()].map(({ csv }) => csv);
+      const last = chunks[chunks.length - 1];
+      if (last.files) chunks.push({ content: "-# 回答と表のデータ", files: [...exports, source] });
+      else last.files = [...exports, source];
+    }
     try {
       return await this.deliver(chunks, components, tables.length > 0);
     } catch (error) {
@@ -177,6 +183,8 @@ export class LiveReply {
     const result = new Map<AnswerTable, TablePresentation>();
     let available = MAX_TABLE_IMAGES;
     for (const [index, table] of tables.entries()) {
+      // The original Markdown shares the final message's attachment allowance with the CSVs.
+      if (result.size === MAX_DISCORD_ATTACHMENTS - 1) break;
       try {
         const presentation = await presentTable(table, index + 1, available);
         if (presentation) {
