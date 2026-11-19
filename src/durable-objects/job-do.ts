@@ -77,6 +77,7 @@ interface CostWatch {
   messageId: string;
   /** The last chunk as delivered; a different current content means it was regenerated. */
   content: string;
+  answerUpdatedAt?: number;
   cost: AnswerCost;
   currency: Currency;
   rate: number;
@@ -165,12 +166,14 @@ export class JobDO extends DurableObject<Env> {
     answer: Answer,
     prefs: Prefs,
     deadline: number,
+    answerUpdatedAt?: number,
   ): CostWatch | null {
     if (!confirmable(answer.cost)) return null;
     return {
       token,
       messageId: delivered.lastId,
       content: delivered.lastContent,
+      answerUpdatedAt,
       cost: answer.cost,
       currency: prefs.currency,
       rate: usdJpyRate(this.env.AI_USD_JPY_RATE),
@@ -213,7 +216,15 @@ export class JobDO extends DurableObject<Env> {
     const discord = this.discord();
     try {
       const current = await discord.getMessage(watch.token, watch.messageId);
-      if (current.content.trim() !== watch.content.trim()) {
+      // Regenerated tables can have identical visible text and different attachments.
+      const record =
+        watch.answerUpdatedAt === undefined
+          ? null
+          : await this.state().getRegenRecord(watch.messageId);
+      if (
+        current.content.trim() !== watch.content.trim() ||
+        (record && record.updatedAt !== watch.answerUpdatedAt)
+      ) {
         console.log("cost watch: answer was replaced; leaving it alone");
       } else {
         await discord.editMessage(
@@ -273,6 +284,7 @@ export class JobDO extends DurableObject<Env> {
   ): Promise<CostWatch | null> {
     const discord = this.discord();
     let messages: AnthropicMessage[];
+    let missingSource = false;
 
     if (job.kind === "slash") {
       const content: ContentBlock[] = job.attachment
@@ -291,7 +303,9 @@ export class JobDO extends DurableObject<Env> {
           { role: "user", content: [textBlock(job.prompt)] },
         ]);
       } else {
-        const history = await buildHistoryFromMessage(target, discord);
+        const history = await buildHistoryFromMessage(target, discord, undefined, () => {
+          missingSource = true;
+        });
         messages = pruneConversationHistory([
           ...history,
           { role: "user", content: [textBlock(job.prompt)] },
@@ -329,9 +343,14 @@ export class JobDO extends DurableObject<Env> {
       await this.markAnswered();
       return null;
     }
-    const delivered = await live.finish(answer.text, answerButtons(), this.footer(answer, prefs));
+    const footer = this.footer(answer, prefs);
+    const delivered = await live.finish(
+      answer.text,
+      answerButtons(),
+      missingSource ? `-# 元の回答の添付を一部読み込めませんでした。\n${footer}` : footer,
+    );
     await this.markAnswered();
-    await this.state().saveRegenRecord({
+    const updatedAt = await this.state().saveRegenRecord({
       chunkIds: delivered.ids,
       messagesJson: JSON.stringify(messages),
       userId: job.userId,
@@ -346,6 +365,7 @@ export class JobDO extends DurableObject<Env> {
       answer,
       prefs,
       Math.min(Date.now() + COST_WAIT_MS, begun + TOKEN_EDIT_MS),
+      updatedAt,
     );
   }
 
@@ -427,7 +447,7 @@ export class JobDO extends DurableObject<Env> {
     await ack.stop();
 
     const delivered = await reply.finish(answer.text, answerButtons(), this.footer(answer, prefs));
-    await state.saveRegenRecord({
+    const updatedAt = await state.saveRegenRecord({
       chunkIds: delivered.ids,
       messagesJson: record.messagesJson,
       userId: job.userId,
@@ -445,7 +465,14 @@ export class JobDO extends DurableObject<Env> {
     // The original token's age is unknown here; an expired one just fails the later edit.
     return delivered.failed
       ? null
-      : this.costWatch(delivered, record.token, answer, prefs, Date.now() + COST_WAIT_MS);
+      : this.costWatch(
+          delivered,
+          record.token,
+          answer,
+          prefs,
+          Date.now() + COST_WAIT_MS,
+          updatedAt,
+        );
   }
 
   private async reportError(token: string, err: unknown, settings = false): Promise<void> {

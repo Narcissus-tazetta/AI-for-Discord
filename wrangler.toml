@@ -4,6 +4,11 @@ main = "src/index.ts"
 # breaks `wrangler dev`. Regenerate runtime types (`bun run types`) after changing it.
 compatibility_date = "2026-10-06"
 
+[[rules]]
+type = "Data"
+globs = ["**/*.otf"]
+fallthrough = true
+
 # No kv_namespaces here, deliberately: Workers KV quotas are per *account*, and the
 # discord-youtube-websub-worker on this same account already burns half the daily limit.
 # All state lives in Durable Object SQLite storage, which is metered separately.

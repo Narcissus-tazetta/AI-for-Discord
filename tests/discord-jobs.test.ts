@@ -286,7 +286,9 @@ describe("Discord delivery and regeneration", () => {
     let next = 0;
     const handle = (url: string, options?: RequestInit) => {
       const method = options?.method ?? "GET";
-      const body = options?.body ? JSON.parse(String(options.body)) : null;
+      const payload =
+        options?.body instanceof FormData ? options.body.get("payload_json") : options?.body;
+      const body = payload ? JSON.parse(String(payload)) : null;
       const channelMatch = url.match(/channels\/([^/?]+)\/messages\/([^?]+)/);
       if (channelMatch) {
         const [, , msgId] = channelMatch;
@@ -309,7 +311,7 @@ describe("Discord delivery and regeneration", () => {
           id,
           channel_id: "channel",
           author: { id: "app" },
-          attachments: [],
+          attachments: body?.attachments ?? messages.get(id)?.attachments ?? [],
         });
       return json(messages.get(id));
     };
@@ -394,7 +396,7 @@ describe("Discord delivery and regeneration", () => {
   });
 
   test("an unconfirmed cost falls back to the estimate, and a replaced answer is left alone", async () => {
-    const { env, kv, ready } = setup();
+    const { env, kv, ready, state } = setup();
     await ready();
     kv.set("ai_registry", registry());
     const discord = fakeDiscord();
@@ -440,6 +442,14 @@ describe("Discord delivery and regeneration", () => {
     await replaced.job.alarm();
     expect(discord.messages.get(otherId).content).toBe("再生成された別の回答");
     expect(replaced.storage.kv.size).toBe(0);
+
+    const sameContent = await run();
+    const watch = sameContent.storage.kv.get("costWatch");
+    watch.answerUpdatedAt -= 1;
+    const before = discord.messages.get(watch.messageId).content;
+    expect(state.getRegenRecord(watch.messageId)?.updatedAt).toBeGreaterThan(watch.answerUpdatedAt);
+    await sameContent.job.alarm();
+    expect(discord.messages.get(watch.messageId).content).toBe(before);
   });
 
   test("forged model selections and someone else's settings do not change prefs", async () => {
@@ -473,6 +483,7 @@ describe("Discord delivery and regeneration", () => {
     state.setPref("123", "model", model().id);
     const discord = fakeDiscord();
     const chatRequests: any[] = [];
+    const tableAnswer = `${"あ".repeat(3000)}\n\n| 首都 | 国 |\n| --- | --- |\n| 東京 | 日本 |`;
     spyOn(globalThis, "fetch").mockImplementation((async (url: string, options?: RequestInit) => {
       if (url.includes("/generation")) return json({ data: { total_cost: 0.001 } });
       if (url.includes("/chat/completions")) {
@@ -486,7 +497,7 @@ describe("Discord delivery and regeneration", () => {
               message: {
                 content:
                   chatRequests.length === 1
-                    ? "あ".repeat(3000)
+                    ? tableAnswer
                     : "日本の首都は東京で、人口は約1400万人です。",
               },
               finish_reason: "stop",
@@ -512,8 +523,12 @@ describe("Discord delivery and regeneration", () => {
 
     expect(discord.messages.has("1")).toBe(true);
     expect(discord.messages.has("2")).toBe(true);
+    expect(discord.messages.get("1").attachments[0].filename).toBe("answer-source.md");
+    expect(
+      discord.messages.get("2").attachments.map((file: { filename: string }) => file.filename),
+    ).toEqual(["table-1.png", "table-1.csv"]);
     const rec1 = state.getRegenRecord("2");
-    expect(rec1?.answerText).toBe("あ".repeat(3000));
+    expect(rec1?.answerText).toBe(tableAnswer);
 
     const contStorage = context();
     const contJob = new JobDO(contStorage.ctx as any, env);
@@ -537,7 +552,7 @@ describe("Discord delivery and regeneration", () => {
     });
     expect(contMessages[1]).toEqual({
       role: "assistant",
-      content: [{ type: "text", text: "あ".repeat(3000) }],
+      content: [{ type: "text", text: tableAnswer }],
     });
     expect(contMessages[2]).toEqual({
       role: "user",
@@ -707,63 +722,109 @@ describe("Discord delivery and regeneration", () => {
     expect(turn3Messages[0].content[0].text).toContain("（以前のメッセージのため省略）");
   });
 
-  test("continue job falls back to parsing message content when RegenRecord is missing", async () => {
-    const { state, env, kv, ready } = setup();
-    await ready();
-    kv.set("ai_registry", registry());
-    state.setPref("123", "model", model().id);
-    const discord = fakeDiscord();
-    discord.messages.set("99", {
-      id: "99",
-      channel_id: "channel",
-      author: { id: "app" },
-      content: "**Q:** キャッシュ外の質問\n\n**A:**\nキャッシュ外の回答\n\n-# モデル: auto",
-      attachments: [],
-    });
-    const chatRequests: any[] = [];
-    spyOn(globalThis, "fetch").mockImplementation((async (url: string, options?: RequestInit) => {
-      if (url.includes("/generation")) return json({ data: { total_cost: 0.001 } });
-      if (url.includes("/chat/completions")) {
-        const body = options?.body ? JSON.parse(String(options.body)) : null;
-        chatRequests.push(body);
-        return json({
-          id: "g",
-          model: model().id,
-          choices: [{ message: { content: "フォールバック回答" }, finish_reason: "stop" }],
+  test.each(["text", "source", "linked", "missing-original", "csv", "missing"])(
+    "continues without a cache using %s",
+    async (mode) => {
+      const { state, env, kv, ready } = setup();
+      await ready();
+      kv.set("ai_registry", registry());
+      state.setPref("123", "model", model().id);
+      const discord = fakeDiscord();
+      const header = "**Q:** キャッシュ外の質問\n\n**A:**\n";
+      const table = "| 商品 | 在庫 |\n| --- | --- |\n| りんご | 12 |\n\n-# 回答に元からある注記";
+      const csv = '\uFEFF"商品","在庫"\r\n"りんご","12"\r\n';
+      const followup = mode === "linked" || mode === "missing-original";
+      const sourceMode = mode === "source" || mode === "linked";
+      const file = sourceMode ? "answer-source.md" : "table-1.csv";
+      const attachment = `https://cdn.discordapp.com/attachments/1/2/${file}?ex=1`;
+      const exported = sourceMode ? header + table : csv;
+      const visible =
+        mode === "source"
+          ? "在庫が足りるかも確認してください。"
+          : followup
+            ? "**表 1（2/2）**"
+            : header + (mode === "text" ? "キャッシュ外の回答" : "**表 1**");
+      const files = [{ id: "2", filename: file, url: attachment, size: new Blob([exported]).size }];
+      if (mode === "linked") {
+        discord.messages.set("98", {
+          id: "98",
+          channel_id: "channel",
+          author: { id: "app" },
+          attachments: files,
         });
       }
-      if (url.startsWith("https://discord.mock/")) return discord.handle(url, options);
-      throw new Error(`unexpected request: ${url}`);
-    }) as any);
+      discord.messages.set("99", {
+        id: "99",
+        channel_id: "channel",
+        author: { id: "app" },
+        content: `${visible}\n\n-# モデル: auto`,
+        attachments: mode === "text" || followup ? [] : files,
+        ...(followup ? { interaction_metadata: { original_response_message_id: "98" } } : {}),
+      });
+      const chatRequests: any[] = [];
+      spyOn(globalThis, "fetch").mockImplementation((async (url: string, options?: RequestInit) => {
+        if (url === attachment)
+          return mode === "missing" ? new Response(null, { status: 404 }) : new Response(exported);
+        if (url.includes("/generation")) return json({ data: { total_cost: 0.001 } });
+        if (url.includes("/chat/completions")) {
+          const body = options?.body ? JSON.parse(String(options.body)) : null;
+          chatRequests.push(body);
+          return json({
+            id: "g",
+            model: model().id,
+            choices: [{ message: { content: "フォールバック回答" }, finish_reason: "stop" }],
+          });
+        }
+        if (url.startsWith("https://discord.mock/")) return discord.handle(url, options);
+        throw new Error(`unexpected request: ${url}`);
+      }) as any);
 
-    const job = new JobDO(context().ctx as any, env);
-    await job.start({
-      kind: "continue",
-      token: "tok-fallback",
-      userId: "123",
-      ephemeral: true,
-      prompt: "フォールバックの継続質問",
-      channelId: "channel",
-      messageId: "99",
-    });
-    await job.alarm();
+      const job = new JobDO(context().ctx as any, env);
+      await job.start({
+        kind: "continue",
+        token: "tok-fallback",
+        userId: "123",
+        ephemeral: true,
+        prompt: "フォールバックの継続質問",
+        channelId: "channel",
+        messageId: "99",
+      });
+      await job.alarm();
 
-    expect(chatRequests).toHaveLength(1);
-    const msgs = chatRequests[0].messages.slice(1);
-    expect(msgs).toHaveLength(3);
-    expect(msgs[0]).toEqual({
-      role: "user",
-      content: [{ type: "text", text: "キャッシュ外の質問" }],
-    });
-    expect(msgs[1]).toEqual({
-      role: "assistant",
-      content: [{ type: "text", text: "キャッシュ外の回答" }],
-    });
-    expect(msgs[2]).toEqual({
-      role: "user",
-      content: [{ type: "text", text: "フォールバックの継続質問" }],
-    });
-  });
+      expect(chatRequests).toHaveLength(1);
+      const msgs = chatRequests[0].messages.slice(1);
+      expect(msgs).toHaveLength(3);
+      expect(msgs[0].role).toBe("user");
+      if (mode !== "missing-original") {
+        expect(msgs[0].content).toEqual([{ type: "text", text: "キャッシュ外の質問" }]);
+      }
+      expect(msgs[1]).toEqual({
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: sourceMode
+              ? table
+              : mode === "csv"
+                ? `**表 1**\n${csv.slice(1).trimEnd().replaceAll("\r\n", "\n")}`
+                : mode === "missing"
+                  ? "**表 1**\n（元の表データを取得できませんでした）"
+                  : mode === "missing-original"
+                    ? "**表 1（2/2）**\n（元の表データを取得できませんでした）\n\n-# モデル: auto"
+                    : "キャッシュ外の回答",
+          },
+        ],
+      });
+      expect(msgs[2]).toEqual({
+        role: "user",
+        content: [{ type: "text", text: "フォールバックの継続質問" }],
+      });
+      if (mode === "missing" || mode === "missing-original")
+        expect(discord.messages.get("1").content).toContain(
+          "元の回答の添付を一部読み込めませんでした",
+        );
+    },
+  );
 
   test("continue job falls back to synthetic anchor when bot message is unparseable", async () => {
     const { state, env, kv, ready } = setup();

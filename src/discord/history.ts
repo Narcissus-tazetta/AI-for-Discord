@@ -13,7 +13,8 @@ import type {
   DiscordAttachment,
   DiscordMessage,
 } from "../shared/types";
-import type { DiscordClient } from "./api";
+import { ANSWER_SOURCE_FILENAME, readAnswerSource } from "./answer-source";
+import { type DiscordClient, DiscordError } from "./api";
 
 /** How many of the most recent user turns send their files to the model. */
 const ATTACHMENT_TURNS = 2;
@@ -88,19 +89,67 @@ export function normalizeTurns(turns: AnthropicMessage[]): AnthropicMessage[] {
   return merged;
 }
 
-export function parseBotAnswer(content: string): { prompt: string; answer: string } | null {
-  const normalized = content.replace(/\r\n/g, "\n");
-  const trimmed = normalized.trim();
-  const match = trimmed.match(/^\*\*Q:\*\*\s*([\s\S]*?)\n\n\*\*A:\*\*[ \t]*\n([\s\S]*)$/);
+export function parseBotAnswer(
+  content: string,
+  fromSource = false,
+): { prompt: string; answer: string } | null {
+  const text = fromSource ? content : content.replace(/\r\n/g, "\n").trim();
+  const match = text.match(/^\*\*Q:\*\*\s*([\s\S]*?)\n\n\*\*A:\*\*[ \t]*\n([\s\S]*)$/);
   if (!match) return null;
   const prompt = match[1].trim();
   const rawAnswer = match[2];
-  const answer = rawAnswer
-    .trimEnd()
-    .replace(/(?:(?:\n\n?|^)-#[^\n]*)+$/, "")
-    .trim();
-  if (!prompt || !answer) return null;
+  const answer = fromSource
+    ? rawAnswer
+    : rawAnswer
+        .trimEnd()
+        .replace(/(?:(?:\n\n?|^)-#[^\n]*)+$/, "")
+        .trim();
+  if (!prompt || !answer.trim()) return null;
   return { prompt, answer };
+}
+
+async function recoverBotAnswer(
+  message: DiscordMessage,
+  text: string,
+  discord: DiscordClient,
+  onMissingSource?: () => void,
+) {
+  const files = message.attachments ?? [];
+  let source = files.find(({ filename }) => filename === ANSWER_SOURCE_FILENAME);
+  const originalId = message.interaction_metadata?.original_response_message_id;
+  let missing = false;
+  if (!source && originalId) {
+    try {
+      const original = await discord.fetchMessage(message.channel_id, originalId);
+      source = original.attachments?.find(({ filename }) => filename === ANSWER_SOURCE_FILENAME);
+    } catch (error) {
+      if (!(error instanceof DiscordError) || ![403, 404].includes(error.status)) throw error;
+      missing = true;
+      console.log(`history: answer source message unavailable (${error.status})`);
+    }
+  }
+  if (source) {
+    const content = await readAnswerSource(source);
+    const parsed = content && parseBotAnswer(content, true);
+    if (parsed) return { text: content, parsed };
+  }
+
+  // The CSV belongs to the first image page, while later pages need the original response.
+  const marker = /^\*\*表 (\d+)(?:（\d+\/\d+）)?\*\*$/gm;
+  const numbers = new Set(Array.from(text.matchAll(marker), (match) => match[1]));
+  const tables = new Map<string, string>();
+  for (const number of numbers) {
+    const file = files.find(({ filename }) => filename === `table-${number}.csv`);
+    const csv = file && (await readAnswerSource(file))?.trimEnd();
+    if (csv) tables.set(number, csv);
+    else missing = true;
+  }
+  if (missing || source) onMissingSource?.();
+  const restored = text.replace(marker, (label, number: string) => {
+    const csv = tables.get(number);
+    return `${label}\n${csv ?? "（元の表データを取得できませんでした）"}`;
+  });
+  return { text: restored, parsed: parseBotAnswer(restored) };
 }
 
 function decodeFilename(raw: string): string {
@@ -182,6 +231,7 @@ export async function buildHistoryFromMessage(
   startMessage: DiscordMessage,
   discord: DiscordClient,
   limit: number = HISTORY_DEPTH,
+  onMissingSource?: () => void,
 ): Promise<AnthropicMessage[]> {
   const appId = discord.appId;
   let turns: AnthropicMessage[] = [];
@@ -198,7 +248,8 @@ export async function buildHistoryFromMessage(
 
     if (isBot) {
       pendingBotUserTurn = null;
-      const parsed = parseBotAnswer(text);
+      const recovered = await recoverBotAnswer(curr, text, discord, onMissingSource);
+      const { parsed } = recovered;
       if (parsed) {
         const userTurn: AnthropicMessage = {
           role: "user",
@@ -207,8 +258,8 @@ export async function buildHistoryFromMessage(
         turns.unshift({ role: "assistant", content: [textBlock(parsed.answer)] });
         turns.unshift(userTurn);
         pendingBotUserTurn = userTurn;
-      } else if (text) {
-        turns.unshift({ role: "assistant", content: [textBlock(text)] });
+      } else if (recovered.text) {
+        turns.unshift({ role: "assistant", content: [textBlock(recovered.text)] });
       }
     } else {
       userTurns += 1;

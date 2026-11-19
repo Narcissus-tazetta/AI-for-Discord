@@ -57,6 +57,7 @@ interface RecordRow extends Record<string, SqlStorageValue> {
   ephemeral: number;
   token: string;
   answer_text: string;
+  created_at: number;
 }
 
 interface IndexRow extends Record<string, SqlStorageValue> {
@@ -685,10 +686,11 @@ export class StateDO extends DurableObject<Env> {
     ephemeral: boolean;
     token: string;
     answerText?: string;
-  }): void {
+  }): number | undefined {
     if (!record.chunkIds.length) return;
     const sql = this.ctx.storage.sql;
     const recordId = record.chunkIds[0];
+    const updatedAt = Date.now();
 
     sql.exec(
       `INSERT INTO regen_records (record_id, messages, user_id, header, ephemeral, token, created_at, answer_text)
@@ -707,7 +709,7 @@ export class StateDO extends DurableObject<Env> {
       record.header,
       record.ephemeral ? 1 : 0,
       record.token,
-      Date.now(),
+      updatedAt,
       record.answerText ?? "",
     );
     sql.exec("DELETE FROM regen_index WHERE record_id = ?", recordId);
@@ -732,6 +734,7 @@ export class StateDO extends DurableObject<Env> {
       sql.exec("DELETE FROM regen_index WHERE record_id = ?", record_id);
       sql.exec("DELETE FROM regen_records WHERE record_id = ?", record_id);
     }
+    return updatedAt;
   }
 
   /** Two-step lookup: any chunk's message id -> record id -> the record itself. */
@@ -765,6 +768,7 @@ export class StateDO extends DurableObject<Env> {
       token: row.token,
       chunkIds,
       answerText: row.answer_text as string,
+      updatedAt: row.created_at,
     };
   }
 }

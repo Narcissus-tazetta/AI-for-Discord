@@ -1,6 +1,9 @@
 import { MSG_REGEN_SUPERSEDED } from "../shared/constants";
-import { type DiscordClient, DiscordError } from "./api";
-import { chunkText } from "./chunk";
+import { answerSource } from "./answer-source";
+import { type DiscordClient, DiscordError, type DiscordUpload } from "./api";
+import { type AnswerChunk, chunkAnswer, chunkText } from "./chunk";
+import { presentTable, type TablePresentation } from "./table-image";
+import { type AnswerTable, parseTables } from "./tables";
 
 export const CID_ANSWER_REGEN = "ans:regen";
 export const CID_ANSWER_CONTINUE = "ans:cont";
@@ -37,6 +40,7 @@ const FALLBACK_FRAME_MS = 1500;
 const STATUS_FRAME_MS = 1000;
 const TICK_MS = 250;
 const CURSOR = " ▌";
+const MAX_TABLE_IMAGES = 4;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -48,6 +52,12 @@ export interface Delivered {
   lastContent: string;
 }
 
+class TableDeliveryRejected extends Error {
+  constructor(readonly reason: "upload" | "followupLimit") {
+    super(reason);
+  }
+}
+
 /**
  * One answer shown as it is produced: a status line while waiting, then the text growing in
  * place, spilling into follow-up messages past Discord's length limit. Intermediate edits are
@@ -56,6 +66,7 @@ export interface Delivered {
 export class LiveReply {
   private readonly ids: string[];
   private readonly sent: (string | undefined)[] = [];
+  private readonly attached = new Set<number>();
   /** Which message carries the answer buttons, so moving them clears the old ones. */
   private buttonsAt: number | null;
   private status = "";
@@ -133,26 +144,82 @@ export class LiveReply {
         bucket: rate?.bucket ?? null,
       }),
     );
-    const chunks = chunkText(this.header + body, footer);
+    const tables = parseTables(body);
+    const source = tables.length ? answerSource(this.header, body) : null;
+    const presentations = source ? await this.prepareTables(tables) : new Map();
+    const chunks = chunkAnswer(this.header, body, footer, tables, presentations);
+    if (source && presentations.size) chunks[0].files = [...(chunks[0].files ?? []), source];
+    try {
+      return await this.deliver(chunks, components, tables.length > 0);
+    } catch (error) {
+      if (!(error instanceof TableDeliveryRejected)) throw error;
+      console.log(`live reply: ${error.message}; using text tables`);
+      const text = chunkAnswer(this.header, body, footer, tables, new Map());
+      if (error.reason !== "followupLimit" || text.length <= this.ids.length) {
+        try {
+          return await this.deliver(text, components, true);
+        } catch (fallbackError) {
+          if (
+            !(fallbackError instanceof TableDeliveryRejected) ||
+            fallbackError.reason !== "followupLimit"
+          )
+            throw fallbackError;
+        }
+      }
+      const compact = chunkText(this.header + body, footer).map((content) => ({ content }));
+      return await this.deliver(compact, components, false);
+    }
+  }
+
+  private async prepareTables(tables: AnswerTable[]): Promise<Map<AnswerTable, TablePresentation>> {
+    const result = new Map<AnswerTable, TablePresentation>();
+    let available = MAX_TABLE_IMAGES;
+    for (const [index, table] of tables.entries()) {
+      try {
+        const presentation = await presentTable(table, index + 1, available);
+        if (presentation) {
+          result.set(table, presentation);
+          if (presentation.kind === "image") available -= presentation.pages.length;
+        }
+      } catch (error) {
+        console.error(
+          `live reply: table ${index + 1} render failed: ${error instanceof Error ? error.name : "unknown"}`,
+        );
+      }
+    }
+    return result;
+  }
+
+  private async deliver(
+    chunks: AnswerChunk[],
+    components: unknown[],
+    retryWithLessFormatting: boolean,
+  ): Promise<Delivered> {
     let failed = false;
     const last = chunks.length - 1;
     for (let i = 0; i < chunks.length; i++) {
+      const { content, files } = chunks[i];
       const buttons = i === last ? components : [];
-      const moved = (i === last) !== (this.buttonsAt === i);
-      if (this.sent[i] === chunks[i] && !moved) continue;
+      const moved = Boolean(buttons.length) !== (this.buttonsAt === i);
+      if (this.sent[i] === content && !moved && !files && !this.attached.has(i)) continue;
       try {
-        await this.withRetry(() => this.write(i, chunks[i], buttons));
+        await this.withRetry(() => this.write(i, content, buttons, files));
       } catch (err) {
+        if (err instanceof DiscordError && retryWithLessFormatting && err.followupLimitReached) {
+          throw new TableDeliveryRejected("followupLimit");
+        }
+        if (files && err instanceof DiscordError && [400, 403, 413].includes(err.status)) {
+          throw new TableDeliveryRejected("upload");
+        }
         if (!this.tolerant) throw err;
         failed = true;
         console.log(`live reply: failed to write chunk ${i}: ${err}`);
       }
     }
-    this.buttonsAt = last;
     for (let i = chunks.length; i < this.ids.length; i++) {
       try {
         await this.withRetry(() =>
-          this.discord.editMessage(this.token, this.ids[i], MSG_REGEN_SUPERSEDED, []),
+          this.discord.editMessage(this.token, this.ids[i], MSG_REGEN_SUPERSEDED, [], []),
         );
       } catch (err) {
         if (!this.tolerant) throw err;
@@ -161,7 +228,7 @@ export class LiveReply {
       }
     }
     const ids = this.ids.slice(0, chunks.length);
-    return { ids, failed, lastId: ids[ids.length - 1], lastContent: chunks[last] };
+    return { ids, failed, lastId: ids[ids.length - 1], lastContent: chunks[last].content };
   }
 
   private live(): string | null {
@@ -219,11 +286,16 @@ export class LiveReply {
     return usable > 0 ? rate.resetAfterMs / usable : rate.resetAfterMs;
   }
 
-  private async write(i: number, content: string, components?: unknown[]): Promise<void> {
+  private async write(
+    i: number,
+    content: string,
+    components?: unknown[],
+    files?: DiscordUpload[],
+  ): Promise<void> {
     if (i < this.ids.length) {
-      await this.discord.editMessage(this.token, this.ids[i], content, components);
+      await this.discord.editMessage(this.token, this.ids[i], content, components, files ?? []);
     } else if (i === 0) {
-      const message = await this.patchOriginalWhenReady(content, components);
+      const message = await this.patchOriginalWhenReady(content, components, files);
       this.ids.push(message.id);
     } else {
       const message = await this.discord.sendFollowup(
@@ -231,10 +303,15 @@ export class LiveReply {
         content,
         this.ephemeral,
         components,
+        files,
       );
       this.ids.push(message.id);
     }
     this.sent[i] = content;
+    if (files) this.attached.add(i);
+    else this.attached.delete(i);
+    if (components?.length) this.buttonsAt = i;
+    else if (components && this.buttonsAt === i) this.buttonsAt = null;
   }
 
   private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
@@ -253,10 +330,14 @@ export class LiveReply {
    * The job can, in principle, out-race Discord recording our deferred response, which shows
    * up as an unknown-token rejection on the very first edit.
    */
-  private async patchOriginalWhenReady(content: string, components?: unknown[]) {
+  private async patchOriginalWhenReady(
+    content: string,
+    components?: unknown[],
+    files?: DiscordUpload[],
+  ) {
     for (let attempt = 0; ; attempt++) {
       try {
-        return await this.discord.patchOriginal(this.token, content, components);
+        return await this.discord.patchOriginal(this.token, content, components, files);
       } catch (err) {
         const unknownToken =
           err instanceof DiscordError && (err.status === 404 || err.status === 401);

@@ -11,4 +11,14 @@ mock.module("cloudflare:workers", () => ({
   },
 }));
 
+// Wrangler imports these as compiled WASM and binary data. Bun imports both as paths.
+const wasm = await Bun.file(
+  new URL(import.meta.resolve("@resvg/resvg-wasm/index_bg.wasm")),
+).arrayBuffer();
+const font = await Bun.file(
+  new URL("../src/discord/fonts/discord-table-sans.otf", import.meta.url),
+).arrayBuffer();
+mock.module("@resvg/resvg-wasm/index_bg.wasm", () => ({ default: new WebAssembly.Module(wasm) }));
+mock.module("../src/discord/fonts/discord-table-sans.otf", () => ({ default: font }));
+
 afterEach(() => mock.restore());

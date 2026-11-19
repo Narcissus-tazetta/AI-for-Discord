@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { chunkText } from "../src/discord/chunk";
+import stringWidth from "string-width";
+import { chunkAnswer, chunkText } from "../src/discord/chunk";
 import {
   attachmentBlocks,
   buildHistoryFromMessage,
@@ -70,6 +71,72 @@ describe("normalizeTurns", () => {
     normalizeTurns(original);
     expect(original[0].content).toHaveLength(1);
   });
+});
+
+test("splits long Discord tables between rows and repeats their headings", () => {
+  const rows = Array.from({ length: 100 }, (_, i) => `row-${i} | \`a\\|b\` ${"日本語".repeat(5)}`);
+  const chunks = chunkAnswer(
+    "前置き\n\n",
+    ["ID | 値", "--- | ---", ...rows].join("\n"),
+    "-# モデル: test",
+  ).map(({ content }) => content);
+  expect(chunks.length).toBeGreaterThan(1);
+  expect(chunks.every((chunk) => Array.from(chunk).length <= DISCORD_CHUNK_LIMIT + 100)).toBe(true);
+  for (const chunk of chunks) {
+    expect(chunk.match(/^```$/gm)).toHaveLength(2);
+    expect(chunk).toMatch(/^\| ?ID /m);
+  }
+  expect(Array.from(chunks.join("\n").matchAll(/row-\d+/g), ([id]) => id)).toEqual(
+    rows.map((_, i) => `row-${i}`),
+  );
+  expect(chunks.at(-1)).toContain("a|b");
+  expect(chunks.at(-1)).toEndWith("```\n\n-# モデル: test");
+});
+
+test("wraps long Japanese cells before Discord can wrap the whole table row", () => {
+  const longName = "ティーバッグ（アールグレイ）";
+  const body = [
+    "| 商品 | 在庫 | 価格 |",
+    "| --- | ---: | ---: |",
+    "| Orange | 5 | 80円 |",
+    `| ${longName} | 20 | 1,200円 |`,
+  ].join("\n");
+  const [{ content: chunk }] = chunkAnswer("", body);
+  const rows = chunk.split("\n").filter((line) => line.split("|").length === 5);
+  expect(rows.length).toBeGreaterThan(3);
+  expect(new Set(rows.map((row) => stringWidth(row))).size).toBe(1);
+  expect(rows.every((row) => stringWidth(row) <= 34)).toBe(true);
+  expect(
+    rows
+      .slice(2)
+      .map((row) => row.split("|")[1].trim())
+      .join(""),
+  ).toBe(longName);
+  expect(
+    rows
+      .slice(2)
+      .map((row) => row.split("|")[3].trim())
+      .filter(Boolean),
+  ).toEqual(["1,200円"]);
+});
+
+test("keeps notes and citations outside a table even without a blank line", () => {
+  const body =
+    "| 商品 | 価格 |\n| --- | --- |\n| りんご | 150円 |\n注: 参考価格\n出典: https://example.com";
+  const [{ content }] = chunkAnswer("", body);
+  expect(content).toEndWith("```\n\n注: 参考価格\n出典: https://example.com");
+});
+
+test("uses a vertical list when text table headings would wrap into fragments", () => {
+  const body = [
+    "| プラン | 想定する利用者 | 主なメリット | 気を付けたい点 | 導入の手間 |",
+    "| --- | --- | --- | --- | --- |",
+    "| 標準 | 小規模なチーム | 導入しやすい | 一部の機能に制約 | 数分で完了 |",
+  ].join("\n");
+  const [{ content }] = chunkAnswer("", body);
+  expect(content).toBe(
+    "**プラン：標準**\n- 想定する利用者：小規模なチーム\n- 主なメリット：導入しやすい\n- 気を付けたい点：一部の機能に制約\n- 導入の手間：数分で完了",
+  );
 });
 
 describe("chunkText", () => {

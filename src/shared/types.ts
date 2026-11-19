@@ -21,6 +21,7 @@ export interface DiscordMessage {
   content: string;
   attachments: DiscordAttachment[];
   message_reference?: { message_id?: string; channel_id?: string };
+  interaction_metadata?: { original_response_message_id?: string };
 }
 
 interface InteractionDataOption {
@@ -108,4 +109,5 @@ export interface RegenRecordWire {
   /** Every chunk of the answer, in the order it was posted. */
   chunkIds: string[];
   answerText: string;
+  updatedAt: number;
 }

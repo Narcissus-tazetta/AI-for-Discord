@@ -22,6 +22,7 @@
     "@commitlint/cli": "^21.2.3",
     "@commitlint/config-conventional": "^21.2.3",
     "@types/bun": "^1.4.2",
+    "@types/mdast": "^4.0.4",
     "@types/node": "^26.6.4",
     "husky": "^9.1.7",
     "knip": "^6.40.0",
@@ -60,6 +61,11 @@
     "*.{ts,json}": "biome check --write --no-errors-on-unmatched"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.132.1"
+    "@anthropic-ai/sdk": "^0.132.1",
+    "@resvg/resvg-wasm": "^2.6.2",
+    "mdast-util-from-markdown": "^2.1.0",
+    "mdast-util-gfm-table": "^2.0.1",
+    "micromark-extension-gfm-table": "^2.1.2",
+    "string-width": "^9.0.0"
   }
 }

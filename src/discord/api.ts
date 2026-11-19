@@ -3,6 +3,12 @@ import type { DiscordMessage } from "../shared/types";
 
 const DEFAULT_API = "https://discord.com/api/v10";
 
+export interface DiscordUpload {
+  filename: string;
+  description: string;
+  data: Blob;
+}
+
 export class DiscordError extends Error {
   constructor(
     readonly status: number,
@@ -20,6 +26,14 @@ export class DiscordError extends Error {
       return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1000) : null;
     } catch {
       return null;
+    }
+  }
+
+  get followupLimitReached(): boolean {
+    try {
+      return JSON.parse(this.body)?.code === 40094;
+    } catch {
+      return false;
     }
   }
 }
@@ -84,17 +98,24 @@ export class DiscordClient {
    *
    * No `flags` here: ephemerality was fixed at defer time and an edit cannot change it.
    */
-  patchOriginal(token: string, content: string, components?: unknown[]): Promise<DiscordMessage> {
+  patchOriginal(
+    token: string,
+    content: string,
+    components?: unknown[],
+    files?: DiscordUpload[],
+  ): Promise<DiscordMessage> {
     return this.request(
       `${this.base}/webhooks/${this.appId}/${token}/messages/@original`,
       {
         method: "PATCH",
-        headers: JSON_HEADERS,
-        body: JSON.stringify({
-          content,
-          ...(components ? { components } : {}),
-          allowed_mentions: NO_MENTIONS,
-        }),
+        ...messageBody(
+          {
+            content,
+            ...(components ? { components } : {}),
+            allowed_mentions: NO_MENTIONS,
+          },
+          files,
+        ),
       },
       token,
     );
@@ -106,20 +127,23 @@ export class DiscordClient {
     content: string,
     ephemeral: boolean,
     components?: unknown[],
+    files?: DiscordUpload[],
   ): Promise<DiscordMessage> {
     return this.request(
       `${this.base}/webhooks/${this.appId}/${token}?wait=true`,
       {
         method: "POST",
-        headers: JSON_HEADERS,
         // followup messages do NOT inherit the ephemeral flag from the defer; every chunk has
         // to carry it or the tail of a long answer leaks into the channel.
-        body: JSON.stringify({
-          content,
-          flags: ephemeral ? EPHEMERAL : 0,
-          ...(components ? { components } : {}),
-          allowed_mentions: NO_MENTIONS,
-        }),
+        ...messageBody(
+          {
+            content,
+            flags: ephemeral ? EPHEMERAL : 0,
+            ...(components ? { components } : {}),
+            allowed_mentions: NO_MENTIONS,
+          },
+          files,
+        ),
       },
       token,
     );
@@ -131,17 +155,20 @@ export class DiscordClient {
     messageId: string,
     content: string,
     components?: unknown[],
+    files?: DiscordUpload[],
   ): Promise<DiscordMessage> {
     return this.request(
       `${this.base}/webhooks/${this.appId}/${token}/messages/${messageId}`,
       {
         method: "PATCH",
-        headers: JSON_HEADERS,
-        body: JSON.stringify({
-          content,
-          ...(components ? { components } : {}),
-          allowed_mentions: NO_MENTIONS,
-        }),
+        ...messageBody(
+          {
+            content,
+            ...(components ? { components } : {}),
+            allowed_mentions: NO_MENTIONS,
+          },
+          files,
+        ),
       },
       token,
     );
@@ -171,3 +198,23 @@ export class DiscordClient {
 
 const JSON_HEADERS = { "content-type": "application/json" };
 const NO_MENTIONS = { parse: [] as string[] };
+
+function messageBody(
+  payload: object,
+  files?: DiscordUpload[],
+): Pick<RequestInit, "headers" | "body"> {
+  // On edits, omission retains Discord's attachments while an empty array clears them.
+  if (!files?.length) {
+    return {
+      headers: JSON_HEADERS,
+      body: JSON.stringify(files ? { ...payload, attachments: [] } : payload),
+    };
+  }
+  const body = new FormData();
+  const attachments = files.map(({ filename, description, data }, id) => {
+    body.set(`files[${id}]`, data, filename);
+    return { id, filename, description };
+  });
+  body.set("payload_json", JSON.stringify({ ...payload, attachments }));
+  return { body };
+}
