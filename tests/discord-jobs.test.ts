@@ -359,7 +359,7 @@ describe("Discord delivery and regeneration", () => {
     const [first, second] = [discord.messages.get("1"), discord.messages.get("2")];
     expect(first.content.startsWith("**Q:** こんにちは")).toBe(true);
     expect(first.components).toEqual([]);
-    expect(second.flags).toBe(64);
+    expect(second.flags).toBe(64 | 4);
     expect(second.content).toEndWith(`-# モデル: ${model().id}`);
     expect(second.components[0].components.map((c: any) => c.custom_id)).toEqual([
       "ans:regen",
@@ -376,6 +376,7 @@ describe("Discord delivery and regeneration", () => {
     expect(jobStorage.kv.get("costWatch")).toBeDefined();
     await job.alarm();
     expect(discord.messages.get("2").content).toMatch(/｜費用 ¥0\.16$/);
+    expect(discord.messages.get("2").flags).toBe(64 | 4);
     expect(discord.messages.get("2").components).toHaveLength(1);
     expect(jobStorage.kv.size).toBe(0);
 

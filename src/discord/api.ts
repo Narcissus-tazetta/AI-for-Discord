@@ -96,13 +96,14 @@ export class DiscordClient {
    * Replace the "thinking…" placeholder left behind by a deferred response. Returns the
    * message object, so the caller gets an id for the regenerate cache.
    *
-   * No `flags` here: ephemerality was fixed at defer time and an edit cannot change it.
+   * Ephemerality is fixed at defer time, so edit flags only control embeds here.
    */
   patchOriginal(
     token: string,
     content: string,
     components?: unknown[],
     files?: DiscordUpload[],
+    flags?: number,
   ): Promise<DiscordMessage> {
     return this.request(
       `${this.base}/webhooks/${this.appId}/${token}/messages/@original`,
@@ -111,6 +112,7 @@ export class DiscordClient {
         ...messageBody(
           {
             content,
+            ...(flags === undefined ? {} : { flags }),
             ...(components ? { components } : {}),
             allowed_mentions: NO_MENTIONS,
           },
@@ -128,6 +130,7 @@ export class DiscordClient {
     ephemeral: boolean,
     components?: unknown[],
     files?: DiscordUpload[],
+    flags = 0,
   ): Promise<DiscordMessage> {
     return this.request(
       `${this.base}/webhooks/${this.appId}/${token}?wait=true`,
@@ -138,7 +141,7 @@ export class DiscordClient {
         ...messageBody(
           {
             content,
-            flags: ephemeral ? EPHEMERAL : 0,
+            flags: flags | (ephemeral ? EPHEMERAL : 0),
             ...(components ? { components } : {}),
             allowed_mentions: NO_MENTIONS,
           },
@@ -156,6 +159,7 @@ export class DiscordClient {
     content: string,
     components?: unknown[],
     files?: DiscordUpload[],
+    flags?: number,
   ): Promise<DiscordMessage> {
     return this.request(
       `${this.base}/webhooks/${this.appId}/${token}/messages/${messageId}`,
@@ -164,6 +168,7 @@ export class DiscordClient {
         ...messageBody(
           {
             content,
+            ...(flags === undefined ? {} : { flags }),
             ...(components ? { components } : {}),
             allowed_mentions: NO_MENTIONS,
           },

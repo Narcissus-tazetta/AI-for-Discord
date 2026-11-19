@@ -3,7 +3,7 @@ import { DiscordClient } from "../src/discord/api";
 import { LiveReply } from "../src/discord/live-reply";
 import { presentTable } from "../src/discord/table-image";
 import { parseTables } from "../src/discord/tables";
-import type { Env } from "../src/shared/constants";
+import { type Env, EPHEMERAL } from "../src/shared/constants";
 
 const env = {
   DISCORD_APPLICATION_ID: "app",
@@ -170,6 +170,30 @@ test("shows wide comparisons as a list with a CSV and attaches the answer source
   expect(edits[0].content).toContain(`**プラン：標準**\n- 対象：${details}`);
   expect(edits[1].content).toStartWith("まとめ\n\n");
   expect(delivered.lastContent).toBe(edits[1].content);
+});
+
+test("suppresses Discord link previews when table formatting moves citations to a followup", async () => {
+  const writes: { content: string; flags: number; attachments?: { filename: string }[] }[] = [];
+  spyOn(globalThis, "fetch").mockImplementation((async (_url: string, init?: RequestInit) => {
+    const raw = init?.body instanceof FormData ? init.body.get("payload_json") : init?.body;
+    writes.push(JSON.parse(String(raw)));
+    return Response.json({ id: init?.method === "POST" ? "2" : "1" });
+  }) as typeof fetch);
+  const citation = "[出典](https://example.com/reference)";
+  const body = [
+    "前置き".repeat(550),
+    "| 名前 | 個数 |\n| --- | --- |\n| りんご | 2 |",
+    citation,
+  ].join("\n\n");
+  const reply = new LiveReply(new DiscordClient(env), "tok", true, "**A:**\n");
+  await reply.setText(body);
+  const delivered = await reply.finish(body, [], "-# モデル: test");
+  expect(delivered.ids).toEqual(["1", "2"]);
+  expect(writes[0].content).toContain(citation);
+  expect(writes[1].content).not.toContain(citation);
+  expect(writes[1].attachments?.map(({ filename }) => filename)).toContain("table-1.png");
+  expect(writes[2].content).toContain(citation);
+  expect(writes.map(({ flags }) => flags)).toEqual([4, 4, EPHEMERAL | 4]);
 });
 
 test("recovers the end of the answer when image pages exhaust the followup limit", async () => {

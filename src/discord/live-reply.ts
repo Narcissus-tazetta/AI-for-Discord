@@ -41,6 +41,8 @@ const STATUS_FRAME_MS = 1000;
 const TICK_MS = 250;
 const CURSOR = " ▌";
 const MAX_TABLE_IMAGES = 4;
+// Final table layout can move a citation to a different message while Discord still has the old preview.
+const SUPPRESS_EMBEDS = 1 << 2;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -219,7 +221,14 @@ export class LiveReply {
     for (let i = chunks.length; i < this.ids.length; i++) {
       try {
         await this.withRetry(() =>
-          this.discord.editMessage(this.token, this.ids[i], MSG_REGEN_SUPERSEDED, [], []),
+          this.discord.editMessage(
+            this.token,
+            this.ids[i],
+            MSG_REGEN_SUPERSEDED,
+            [],
+            [],
+            SUPPRESS_EMBEDS,
+          ),
         );
       } catch (err) {
         if (!this.tolerant) throw err;
@@ -293,7 +302,14 @@ export class LiveReply {
     files?: DiscordUpload[],
   ): Promise<void> {
     if (i < this.ids.length) {
-      await this.discord.editMessage(this.token, this.ids[i], content, components, files ?? []);
+      await this.discord.editMessage(
+        this.token,
+        this.ids[i],
+        content,
+        components,
+        files ?? [],
+        SUPPRESS_EMBEDS,
+      );
     } else if (i === 0) {
       const message = await this.patchOriginalWhenReady(content, components, files);
       this.ids.push(message.id);
@@ -304,6 +320,7 @@ export class LiveReply {
         this.ephemeral,
         components,
         files,
+        SUPPRESS_EMBEDS,
       );
       this.ids.push(message.id);
     }
@@ -337,7 +354,13 @@ export class LiveReply {
   ) {
     for (let attempt = 0; ; attempt++) {
       try {
-        return await this.discord.patchOriginal(this.token, content, components, files);
+        return await this.discord.patchOriginal(
+          this.token,
+          content,
+          components,
+          files,
+          SUPPRESS_EMBEDS,
+        );
       } catch (err) {
         const unknownToken =
           err instanceof DiscordError && (err.status === 404 || err.status === 401);
