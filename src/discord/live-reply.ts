@@ -42,6 +42,8 @@ const TICK_MS = 250;
 const CURSOR = " ▌";
 const MAX_TABLE_IMAGES = 4;
 const MAX_DISCORD_ATTACHMENTS = 10;
+// An interaction token carries the original response and five followups.
+const MAX_MESSAGES = 6;
 // Final table layout can move a citation to a different message while Discord still has the old preview.
 const SUPPRESS_EMBEDS = 1 << 2;
 
@@ -149,13 +151,39 @@ export class LiveReply {
     );
     const tables = parseTables(body);
     const source = tables.length ? answerSource(this.header, body) : null;
-    const presentations = source ? await this.prepareTables(tables) : new Map();
-    const chunks = chunkAnswer(this.header, body, footer, tables, presentations);
-    if (source && presentations.size) {
-      const exports = [...presentations.values()].map(({ csv }) => csv);
-      const last = chunks[chunks.length - 1];
-      if (last.files) chunks.push({ content: "-# 回答と表のデータ", files: [...exports, source] });
-      else last.files = [...exports, source];
+    const layout = (shown: Map<AnswerTable, TablePresentation>) => {
+      const chunks = chunkAnswer(this.header, body, footer, tables, shown);
+      if (source && shown.size) {
+        const exports = [...shown.values()].map(({ csv }) => csv);
+        const last = chunks[chunks.length - 1];
+        if (last.files)
+          chunks.push({ content: "-# 回答と表のデータ", files: [...exports, source] });
+        else last.files = [...exports, source];
+      }
+      return chunks;
+    };
+    let presentations: Map<AnswerTable, TablePresentation> = source
+      ? await this.prepareTables(tables, false)
+      : new Map();
+    let chunks = layout(presentations);
+    // Pages short enough to read in the preview cost a message each; past the followup limit
+    // the tail would be lost, so trade readability for page count before giving up on images.
+    if (chunks.length > MAX_MESSAGES && presentations.size) {
+      presentations = await this.prepareTables(tables, true);
+      chunks = layout(presentations);
+      while (chunks.length > MAX_MESSAGES) {
+        let heaviest: AnswerTable | undefined;
+        let pages = 0;
+        for (const [table, presentation] of presentations) {
+          if (presentation.kind === "image" && presentation.pages.length >= pages) {
+            heaviest = table;
+            pages = presentation.pages.length;
+          }
+        }
+        if (!heaviest) break;
+        presentations.delete(heaviest);
+        chunks = layout(presentations);
+      }
     }
     try {
       return await this.deliver(chunks, components, tables.length > 0);
@@ -179,14 +207,17 @@ export class LiveReply {
     }
   }
 
-  private async prepareTables(tables: AnswerTable[]): Promise<Map<AnswerTable, TablePresentation>> {
+  private async prepareTables(
+    tables: AnswerTable[],
+    tall: boolean,
+  ): Promise<Map<AnswerTable, TablePresentation>> {
     const result = new Map<AnswerTable, TablePresentation>();
     let available = MAX_TABLE_IMAGES;
     for (const [index, table] of tables.entries()) {
       // The original Markdown shares the final message's attachment allowance with the CSVs.
       if (result.size === MAX_DISCORD_ATTACHMENTS - 1) break;
       try {
-        const presentation = await presentTable(table, index + 1, available);
+        const presentation = await presentTable(table, index + 1, available, tall);
         if (presentation) {
           result.set(table, presentation);
           if (presentation.kind === "image") available -= presentation.pages.length;

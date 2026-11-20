@@ -9,6 +9,11 @@ const MIN_WIDTH = 336;
 const MIN_COLUMN_WIDTH = 64;
 const MAX_COLUMN_WIDTH = 224;
 const MAX_IMAGE_HEIGHT = 4096;
+// Discord fits an attachment into a box about 400px tall, so a taller page is shrunk until its
+// text is unreadable in the preview. About 12 single-line rows keeps it near full size.
+const PREVIEW_PAGE_HEIGHT = 520;
+// Beyond this many readable pages the extra messages cost more than the zoom they save.
+const MAX_PREVIEW_PAGES = 2;
 const MAX_IMAGE_PIXELS = 3_000_000;
 const SCALE = 2;
 const DETAILED_SCALE = 3;
@@ -23,6 +28,37 @@ const graphemes = new Intl.Segmenter();
 const family = "Discord Table Sans";
 const glyphWidths = new Map<number, number>();
 let initialized: Promise<void> | undefined;
+
+// The font has no emoji. Common status marks map to look-alikes it does have; anything else
+// unsupported sends the table back to text rather than drawing tofu.
+const LOOKALIKES: Record<string, string> = {
+  "✅": "✓",
+  "✔": "✓",
+  "☑": "✓",
+  "❌": "×",
+  "✖": "×",
+  "✕": "×",
+  "✗": "×",
+  "✘": "×",
+  "☒": "×",
+  "⭕": "○",
+  "⬆": "↑",
+  "⬇": "↓",
+  "⬅": "←",
+  "⭐": "★",
+  "❤": "♥",
+};
+
+const LOOKALIKE_PATTERN = new RegExp(`[${Object.keys(LOOKALIKES).join("")}]`, "gu");
+
+function drawable(cell: string): string {
+  return cell
+    .replace(/\u200B|\u200C|\u200D|\u2060|\uFE0E|\uFE0F/gu, "")
+    .replace(LOOKALIKE_PATTERN, (char) => LOOKALIKES[char])
+    .replace(/\s+/gu, " ")
+    .trim()
+    .normalize("NFC");
+}
 
 function glyphWidth(text: string): number {
   let width = 0;
@@ -86,13 +122,14 @@ function tableSvg(
   widths: number[],
   align: AnswerTable["align"],
   limit: number,
+  pageHeight: number,
 ): { svg: string; height: number }[] | null {
   const positions = [0];
   for (const width of widths) positions.push(positions[positions.length - 1] + width);
   const tableWidth = positions[positions.length - 1];
   // Shorten pages as tables get wider so the RGBA allocation stays bounded at 2× resolution.
   const maxHeight = Math.floor(
-    Math.min(MAX_IMAGE_HEIGHT / SCALE, MAX_IMAGE_PIXELS / (tableWidth * SCALE ** 2)),
+    Math.min(pageHeight, MAX_IMAGE_HEIGHT / SCALE, MAX_IMAGE_PIXELS / (tableWidth * SCALE ** 2)),
   );
   if (maxHeight < LINE_HEIGHT + PADDING * 2) return null;
   const data = rows.slice(1);
@@ -170,10 +207,15 @@ function csv(rows: string[][], count: number): string {
   return `\uFEFF${rows.map((row) => Array.from({ length: count }, (_, i) => field(row[i] ?? "")).join(",")).join("\r\n")}\r\n`;
 }
 
+/**
+ * `tall` allows pages up to the render limit. Pages are otherwise kept short enough to read in
+ * the preview, which costs a message per page; `tall` is the way back when that is too many.
+ */
 export async function presentTable(
   table: AnswerTable,
   number: number,
   pageLimit: number,
+  tall = false,
 ): Promise<TablePresentation | null> {
   if (!glyphWidths.size) {
     for (const [width, chars] of Object.entries(advances)) {
@@ -181,9 +223,7 @@ export async function presentTable(
     }
   }
   const count = Math.max(...table.rows.map((row) => row.length));
-  const rows = table.rows.map((row) =>
-    row.map((cell) => cell.replace(/\s+/gu, " ").trim().normalize("NFC")),
-  );
+  const rows = table.rows.map((row) => row.map(drawable));
   if (rows.some((row) => row.some((cell) => !Number.isFinite(glyphWidth(cell))))) return null;
 
   const [header, ...data] = rows;
@@ -195,13 +235,22 @@ export async function presentTable(
   const csvFile = () => ({
     filename: `${filename}.csv`,
     description: `表 ${number} のデータ`,
-    data: new Blob([csv(table.rows, count)], { type: "text/csv; charset=utf-8" }),
+    data: new Blob([csv(table.exportRows, count)], { type: "text/csv; charset=utf-8" }),
   });
   if (width > MAX_PREVIEW_TABLE_WIDTH) {
     return { kind: "list", csv: csvFile() };
   }
   if (!pageLimit) return null;
-  const drawings = tableSvg(imageRows, widths, table.align, pageLimit);
+  const drawings =
+    (tall
+      ? null
+      : tableSvg(
+          imageRows,
+          widths,
+          table.align,
+          Math.min(pageLimit, MAX_PREVIEW_PAGES),
+          PREVIEW_PAGE_HEIGHT,
+        )) ?? tableSvg(imageRows, widths, table.align, pageLimit, Infinity);
   if (!drawings) return null;
 
   initialized ??= initWasm(wasm);

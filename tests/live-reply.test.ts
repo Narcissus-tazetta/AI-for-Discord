@@ -254,11 +254,11 @@ test("suppresses Discord link previews when table formatting moves citations to 
   expect(writes.map(({ flags }) => flags)).toEqual([4, 4, EPHEMERAL | 4]);
 });
 
-test("recovers the end of the answer when image pages exhaust the followup limit", async () => {
+function followupServer(limit: number) {
   const messages = new Map<string, { content: string; attachments?: unknown[] }>();
   let refused = 0;
   spyOn(globalThis, "fetch").mockImplementation((async (url: string, init?: RequestInit) => {
-    if (init?.method === "POST" && messages.size === 6) {
+    if (init?.method === "POST" && messages.size === limit) {
       refused++;
       return Response.json({ code: 40094 }, { status: 400 });
     }
@@ -269,12 +269,97 @@ test("recovers the end of the answer when image pages exhaust the followup limit
     messages.set(id, body);
     return Response.json({ id });
   }) as typeof fetch);
-  const tables = Array.from({ length: 4 }, () => "| 項目 | 数値 |\n| --- | --- |\n| A | 1 |");
-  const original = ["あ".repeat(4000), ...tables, "回答末尾"].join("\n\n");
+  return { messages, refused: () => refused };
+}
+
+const smallTable = "| 項目 | 数値 |\n| --- | --- |\n| A | 1 |";
+
+test("drops table images before the followup limit instead of sending them and rolling back", async () => {
+  const { messages, refused } = followupServer(6);
+  const original = ["あ".repeat(4000), ...Array(4).fill(smallTable), "回答末尾"].join("\n\n");
   const reply = new LiveReply(new DiscordClient(env), "tok", false, "");
   const delivered = await reply.finish(original, [], "-# モデル: test");
-  expect(refused).toBe(1);
+  expect(refused()).toBe(0);
+  expect(delivered.failed).toBe(false);
+  expect(messages.size).toBeLessThanOrEqual(6);
+  expect(delivered.lastContent).toEndWith("回答末尾\n\n-# モデル: test");
+});
+
+test("recovers the end of the answer when Discord refuses a followup anyway", async () => {
+  const { messages, refused } = followupServer(3);
+  const original = ["あ".repeat(4000), ...Array(4).fill(smallTable), "回答末尾"].join("\n\n");
+  const reply = new LiveReply(new DiscordClient(env), "tok", false, "");
+  const delivered = await reply.finish(original, [], "-# モデル: test");
+  expect(refused()).toBeGreaterThan(0);
   expect(delivered.failed).toBe(false);
   expect(delivered.lastContent).toEndWith("回答末尾\n\n-# モデル: test");
   expect([...messages.values()].every((message) => !message.attachments?.length)).toBe(true);
+});
+
+test("draws status emoji as look-alikes instead of dropping the table to text", async () => {
+  const body = [
+    "| 機能 | 対応 |",
+    "| --- | --- |",
+    "| 検索 | ✅ 対応 |",
+    "| 画像 | ❌ 非対応 |",
+    "| 音声 | ⚠️​一部 |",
+  ].join("\n");
+  const [table] = parseTables(body);
+  const presentation = await presentTable(table, 1, 4);
+  expect(presentation?.kind).toBe("image");
+  expect(await presentation?.csv.data.text()).toContain('"検索","✅ 対応"');
+});
+
+test("keeps a table with an unsupported emoji as text", async () => {
+  const [table] = parseTables("| 名前 | 印 |\n| --- | --- |\n| A | 🚀 |");
+  expect(await presentTable(table, 1, 4)).toBeNull();
+});
+
+test("shows link labels in the table and lists their destinations under it", async () => {
+  const body = [
+    "| 項目 | 内容 | 出典 |",
+    "| --- | --- | --- |",
+    "| A | 1行目<br>2行目 | [Google](https://blog.google/a_(b)) |",
+    "| B | 旧 **新** | [Google](https://blog.google/a_(b)) |",
+  ].join("\n");
+  const [table] = parseTables(body);
+  expect(table.rows).toEqual([
+    ["項目", "内容", "出典"],
+    ["A", "1行目\n2行目", "Google"],
+    ["B", "旧 新", "Google"],
+  ]);
+  expect(table.exportRows[1][2]).toBe("Google (https://blog.google/a_(b))");
+
+  const messages: { content: string }[] = [];
+  spyOn(globalThis, "fetch").mockImplementation((async (_url: string, init?: RequestInit) => {
+    const raw = init?.body instanceof FormData ? init.body.get("payload_json") : init?.body;
+    messages.push(JSON.parse(String(raw)));
+    return Response.json({ id: String(messages.length) });
+  }) as typeof fetch);
+  await new LiveReply(new DiscordClient(env), "tok", false, "").finish(body, []);
+  const content = messages.map((message) => message.content).join("\n");
+  expect(content).not.toContain("](https://blog.google/a_(b))\n|");
+  expect(content).toContain("-# リンク: [Google](https://blog.google/a_%28b%29)");
+  expect(content.match(/blog\.google/g)).toHaveLength(1);
+});
+
+test("splits a medium table into readable pages and a long one into tall pages", async () => {
+  const rows = (count: number) =>
+    [
+      "| 商品 | 在庫 |",
+      "| --- | --- |",
+      ...Array.from({ length: count }, (_, i) => `| 商品 ${i + 1} | 12 |`),
+    ].join("\n");
+  const heightOf = async (file: { data: Blob }) =>
+    new DataView(await file.data.arrayBuffer()).getUint32(20);
+
+  const medium = await presentTable(parseTables(rows(16))[0], 1, 4);
+  if (medium?.kind !== "image") throw new Error("expected an image table");
+  expect(medium.pages).toHaveLength(2);
+  for (const page of medium.pages) expect(await heightOf(page)).toBeLessThanOrEqual(520 * 3);
+
+  const long = await presentTable(parseTables(rows(60))[0], 1, 4);
+  if (long?.kind !== "image") throw new Error("expected an image table");
+  expect(long.pages.length).toBeGreaterThan(0);
+  expect(await heightOf(long.pages[0])).toBeGreaterThan(520 * 2);
 });

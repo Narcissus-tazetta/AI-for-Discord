@@ -85,14 +85,41 @@ function sourceRange(node: Table | Table["children"][number] | TableCell["childr
   return { start: start.offset, end: end.offset };
 }
 
-function cellText(node: TableCell["children"][number], source: string): string {
+export interface TableLink {
+  text: string;
+  url: string;
+}
+
+// An image or text table can't carry a clickable link, so cells show the label and the
+// destinations are listed under the table instead.
+function cellText(
+  node: TableCell["children"][number],
+  source: string,
+  links: TableLink[] | null,
+  exported: boolean,
+): string {
+  const inner = (children: TableCell["children"]) =>
+    children.map((child) => cellText(child, source, links, exported)).join("");
   switch (node.type) {
     case "text":
     case "inlineCode":
       return node.value;
     case "emphasis":
     case "strong":
-      return node.children.map((child) => cellText(child, source)).join("");
+      return inner(node.children);
+    case "break":
+      return "\n";
+    case "html":
+      // Models emit <br> to put several lines in one cell.
+      return /^<br\s*\/?>$/i.test(node.value) ? "\n" : node.value;
+    case "link":
+    case "image": {
+      const label = node.type === "link" ? inner(node.children) : node.alt || "";
+      const text = label || node.url;
+      if (exported) return text === node.url ? text : `${text} (${node.url})`;
+      links?.push({ text, url: node.url });
+      return text;
+    }
     default: {
       const { start, end } = sourceRange(node);
       return source.slice(start, end);
@@ -103,8 +130,42 @@ function cellText(node: TableCell["children"][number], source: string): string {
 export interface AnswerTable {
   start: number;
   end: number;
+  /** Cell labels as shown in the table; links are reduced to their text. */
   rows: string[][];
+  /** The same cells for a spreadsheet, where a link keeps its destination. */
+  exportRows: string[][];
+  links: TableLink[];
   align: AlignType[];
+}
+
+// Stays well under one Discord message so the line is never split inside a link.
+const LINKS_LINE_LIMIT = 1200;
+
+/** One line under a table naming the destinations its cells linked to. */
+export function linksLine(links: TableLink[]): string {
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  let length = 0;
+  let omitted = 0;
+  for (const { text, url } of links) {
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const label = text.replace(/[[\]\\]/g, "\\$&").replace(/\s+/g, " ");
+    // encodeURIComponent leaves parentheses alone, which would end the link early.
+    const target = url.replace(
+      /[()\s<>]/g,
+      (char) => `%${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
+    );
+    const part = `[${label}](${target})`;
+    if (length + part.length > LINKS_LINE_LIMIT) {
+      omitted++;
+      continue;
+    }
+    parts.push(part);
+    length += part.length + 3;
+  }
+  if (!parts.length) return "";
+  return `-# リンク: ${parts.join(" ・ ")}${omitted ? ` ほか${omitted}件` : ""}`;
 }
 
 export function renderTextTable({ rows, align }: AnswerTable, asVerticalList = false): string[] {
@@ -215,19 +276,24 @@ export function parseTables(source: string): AnswerTable[] {
     // GFM allows table rows without pipes, so prose without a blank line would become a cell.
     const tableRows = trailingProse < 0 ? node.children : node.children.slice(0, trailingProse);
     const end = trailingProse < 0 ? range.end : sourceRange(node.children[trailingProse]).start;
+    const links: TableLink[] = [];
+    const cells = (exported: boolean) =>
+      tableRows.map((row) =>
+        row.children.map((cell) =>
+          cell.children
+            .map((child) => cellText(child, source, exported ? null : links, exported))
+            .join("")
+            .replaceAll("\t", "    "),
+        ),
+      );
     return [
       {
         start: range.start,
         end,
         align: node.align ?? [],
-        rows: tableRows.map((row) =>
-          row.children.map((cell) =>
-            cell.children
-              .map((child) => cellText(child, source))
-              .join("")
-              .replaceAll("\t", "    "),
-          ),
-        ),
+        rows: cells(false),
+        exportRows: cells(true),
+        links,
       },
     ];
   });

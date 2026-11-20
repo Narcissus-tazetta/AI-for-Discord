@@ -1,7 +1,7 @@
 import { DISCORD_CHUNK_LIMIT, DISCORD_MESSAGE_LIMIT } from "../shared/constants";
 import type { DiscordUpload } from "./api";
 import type { TablePresentation } from "./table-image";
-import { type AnswerTable, parseTables, renderTextTable } from "./tables";
+import { type AnswerTable, linksLine, parseTables, renderTextTable } from "./tables";
 
 /** Room left after the footer for the confirmed cost appended to it later. */
 const FOOTER_RESERVE = 40;
@@ -79,6 +79,7 @@ export function chunkAnswer(
         for (const part of chunkText(page)) append(part);
       }
     }
+    append(linksLine(table.links));
     start = table.end;
   }
   for (const part of chunkText(body.slice(start).replace(/^(?:\r?\n)+/, ""))) append(part);
